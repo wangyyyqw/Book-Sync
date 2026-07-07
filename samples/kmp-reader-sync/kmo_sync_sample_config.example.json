@@ -1,0 +1,11 @@
+{
+  "type": "s3",
+  "endpoint": "http://127.0.0.1:9000",
+  "bucket": "kmo-test",
+  "access_key": "minioadmin",
+  "secret_key": "minioadmin",
+  "region": "us-east-1",
+  "root_prefix": "kmo_sync_sample",
+  "path_style": true,
+  "allow_http": true
+}

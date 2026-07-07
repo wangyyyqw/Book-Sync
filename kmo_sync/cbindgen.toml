@@ -1,0 +1,6 @@
+language = "C"
+include_guard = "KMO_SYNC_H"
+pragma_once = true
+
+[export]
+include = ["kmo_sync_t"]

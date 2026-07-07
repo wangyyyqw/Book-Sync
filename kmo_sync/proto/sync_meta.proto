@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package kmo.sync;
+
+message ReadingProgress {
+  string cfi_position = 1;
+  double progress_percent = 2;
+  string chapter_id = 3;
+}
+
+message Bookmark {
+  string bookmark_id = 1;
+  string cfi_range = 2;
+  string title = 3;
+  int64 create_ts = 4;
+}
+
+message Highlight {
+  string highlight_id = 1;
+  string cfi_start = 2;
+  string cfi_end = 3;
+  string color = 4;
+  string comment = 5;
+  int64 create_ts = 6;
+}
+
+message BookNote {
+  string note_id = 1;
+  string relate_cfi = 2;
+  string content = 3;
+  int64 create_ts = 4;
+}
+
+message BookReadingMeta {
+  string meta_id = 1;
+  string book_hash = 2;
+  int64 modified_ts = 3;
+  string device_id = 4;
+  ReadingProgress progress = 5;
+  repeated Bookmark bookmarks = 6;
+  repeated Highlight highlights = 7;
+  repeated BookNote notes = 8;
+  int64 wall_clock_ts = 9;
+  int64 logical_ts = 10;
+  string origin_device_id = 11;
+  repeated MetaEdit edit_history = 12;
+}
+
+message MetaEdit {
+  string edit_id = 1;
+  string device_id = 2;
+  int64 logical_ts = 3;
+
+  oneof op {
+    ReadingProgress progress_update = 4;
+    Bookmark bookmark_add = 5;
+    string bookmark_remove_uuid = 6;
+    Highlight highlight_add = 7;
+    Highlight highlight_update = 8;
+    string highlight_remove_uuid = 9;
+    BookNote note_add = 10;
+    BookNote note_update = 11;
+    string note_remove_uuid = 12;
+  }
+}

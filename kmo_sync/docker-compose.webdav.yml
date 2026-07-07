@@ -1,0 +1,9 @@
+services:
+  webdav:
+    image: bytemark/webdav
+    ports:
+      - "8080:80"
+    environment:
+      AUTH_TYPE: Basic
+      USERNAME: kmo
+      PASSWORD: kmo
