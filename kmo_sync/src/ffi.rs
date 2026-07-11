@@ -4,15 +4,21 @@ use crate::SyncError;
 use crate::event::{EventCallback, EventEmitter};
 use crate::facade::{KmoSyncConfig, KmoSyncFacade};
 use crate::model::BookReadingMeta;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub struct KmoSyncHandle {
     facade: KmoSyncFacade,
-    last_error: Option<String>,
+    last_error: Mutex<Option<String>>,
 }
+
+static HANDLES: OnceLock<Mutex<HashMap<usize, Arc<KmoSyncHandle>>>> = OnceLock::new();
+static NEXT_HANDLE_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[allow(non_camel_case_types)]
 pub type kmo_sync_t = KmoSyncHandle;
@@ -36,7 +42,14 @@ pub extern "C" fn kmo_sync_create(
     );
 
     match result {
-        Ok(handle) => Box::into_raw(Box::new(handle)),
+        Ok(handle) => {
+            let id = NEXT_HANDLE_ID.fetch_add(1, Ordering::Relaxed);
+            let Ok(mut handles) = handle_registry().lock() else {
+                return ptr::null_mut();
+            };
+            handles.insert(id, Arc::new(handle));
+            id as *mut kmo_sync_t
+        }
         Err(_) => ptr::null_mut(),
     }
 }
@@ -46,8 +59,8 @@ pub extern "C" fn kmo_sync_destroy(sync: *mut kmo_sync_t) {
     if sync.is_null() {
         return;
     }
-    unsafe {
-        drop(Box::from_raw(sync));
+    if let Ok(mut handles) = handle_registry().lock() {
+        handles.remove(&(sync as usize));
     }
 }
 
@@ -242,7 +255,9 @@ pub extern "C" fn kmo_sync_rotate_envelope_kek(
     if sync.is_null() {
         return 5;
     }
-    let handle = unsafe { &mut *sync };
+    let Some(handle) = get_handle(sync) else {
+        return 5;
+    };
     match handle
         .facade
         .rotate_envelope_kek(&new_encryption_config_json)
@@ -250,7 +265,7 @@ pub extern "C" fn kmo_sync_rotate_envelope_kek(
         Ok(_) => 0,
         Err(err) => {
             let code = err.code();
-            handle.last_error = Some(err.to_string());
+            set_last_error(&handle, err.to_string());
             code
         }
     }
@@ -290,11 +305,13 @@ pub extern "C" fn kmo_sync_get_local_meta(
         return ptr::null_mut();
     }
 
-    let handle = unsafe { &mut *sync };
+    let Some(handle) = get_handle(sync) else {
+        return ptr::null_mut();
+    };
     match handle.facade.get_local_meta_json(&meta_id) {
         Ok(json) => string_to_raw(json),
         Err(err) => {
-            handle.last_error = Some(err.to_string());
+            set_last_error(&handle, err.to_string());
             ptr::null_mut()
         }
     }
@@ -306,11 +323,13 @@ pub extern "C" fn kmo_sync_get_sync_state(sync: *mut kmo_sync_t) -> *mut c_char 
         return ptr::null_mut();
     }
 
-    let handle = unsafe { &mut *sync };
+    let Some(handle) = get_handle(sync) else {
+        return ptr::null_mut();
+    };
     match handle.facade.get_sync_state_json() {
         Ok(json) => string_to_raw(json),
         Err(err) => {
-            handle.last_error = Some(err.to_string());
+            set_last_error(&handle, err.to_string());
             ptr::null_mut()
         }
     }
@@ -321,8 +340,15 @@ pub extern "C" fn kmo_sync_last_error(sync: *mut kmo_sync_t) -> *mut c_char {
     if sync.is_null() {
         return string_to_raw("sync handle is null".to_string());
     }
-    let handle = unsafe { &mut *sync };
-    string_to_raw(handle.last_error.clone().unwrap_or_default())
+    let Some(handle) = get_handle(sync) else {
+        return string_to_raw("sync handle is closed".to_string());
+    };
+    let message = handle
+        .last_error
+        .lock()
+        .map(|value| value.clone().unwrap_or_default())
+        .unwrap_or_else(|_| "last-error mutex poisoned".to_string());
+    string_to_raw(message)
 }
 
 #[unsafe(no_mangle)]
@@ -366,23 +392,25 @@ fn create_inner(
     let facade = KmoSyncFacade::create(config, EventEmitter::new(callback, user_data))?;
     Ok(KmoSyncHandle {
         facade,
-        last_error: None,
+        last_error: Mutex::new(None),
     })
 }
 
 fn with_handle<F>(sync: *mut kmo_sync_t, op: F) -> i32
 where
-    F: FnOnce(&mut KmoSyncHandle) -> Result<(), SyncError>,
+    F: FnOnce(&KmoSyncHandle) -> Result<(), SyncError>,
 {
     if sync.is_null() {
         return 5;
     }
-    let handle = unsafe { &mut *sync };
-    match op(handle) {
+    let Some(handle) = get_handle(sync) else {
+        return 5;
+    };
+    match op(&handle) {
         Ok(()) => 0,
         Err(err) => {
             let code = err.code();
-            handle.last_error = Some(err.to_string());
+            set_last_error(&handle, err.to_string());
             code
         }
     }
@@ -390,11 +418,31 @@ where
 
 fn set_error(sync: *mut kmo_sync_t, err: SyncError) -> i32 {
     let code = err.code();
-    if !sync.is_null() {
-        let handle = unsafe { &mut *sync };
-        handle.last_error = Some(err.to_string());
+    if let Some(handle) = get_handle(sync) {
+        set_last_error(&handle, err.to_string());
     }
     code
+}
+
+fn handle_registry() -> &'static Mutex<HashMap<usize, Arc<KmoSyncHandle>>> {
+    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn get_handle(sync: *mut kmo_sync_t) -> Option<Arc<KmoSyncHandle>> {
+    if sync.is_null() {
+        return None;
+    }
+    handle_registry()
+        .lock()
+        .ok()?
+        .get(&(sync as usize))
+        .cloned()
+}
+
+fn set_last_error(handle: &KmoSyncHandle, message: String) {
+    if let Ok(mut last_error) = handle.last_error.lock() {
+        *last_error = Some(message);
+    }
 }
 
 fn read_c_string(ptr: *const c_char) -> Option<String> {
@@ -436,5 +484,38 @@ mod tests {
         assert!(!handle.is_null());
         assert_eq!(kmo_sync_all(handle, 0), 0);
         kmo_sync_destroy(handle);
+    }
+
+    #[test]
+    fn ffi_handle_registry_serializes_lifetime_with_concurrent_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = CString::new(r#"{"type":"memory"}"#).unwrap();
+        let encryption = CString::new(r#"{"type":"none"}"#).unwrap();
+        let device = CString::new("device-concurrent").unwrap();
+        let cache = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let handle = kmo_sync_create(
+            storage.as_ptr(),
+            encryption.as_ptr(),
+            device.as_ptr(),
+            cache.as_ptr(),
+            None,
+            ptr::null_mut(),
+        );
+        let id = handle as usize;
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let code = kmo_sync_all(id as *mut kmo_sync_t, 0);
+                        assert!(code == 0 || code == 5);
+                    }
+                })
+            })
+            .collect();
+        kmo_sync_destroy(handle);
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(kmo_sync_all(id as *mut kmo_sync_t, 0), 5);
     }
 }

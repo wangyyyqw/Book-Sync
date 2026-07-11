@@ -2,11 +2,23 @@
 
 use crate::ffi;
 use jni::JNIEnv;
-use jni::objects::{JClass, JString};
+use jni::JavaVM;
+use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use jni::sys::{jint, jlong, jstring};
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+struct AndroidEventCallback {
+    vm: JavaVM,
+    callback: GlobalRef,
+}
+
+static CALLBACKS: OnceLock<Mutex<HashMap<usize, Arc<AndroidEventCallback>>>> = OnceLock::new();
+static NEXT_CALLBACK_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_kmosync_KmoSyncJni_create(
@@ -16,6 +28,7 @@ pub extern "system" fn Java_com_kmosync_KmoSyncJni_create(
     encryption_config_json: JString,
     device_id: JString,
     local_cache_dir: JString,
+    callback: JObject,
 ) -> jlong {
     let Some(storage_config_json) = jstring_to_cstring(&mut env, storage_config_json) else {
         return 0;
@@ -30,14 +43,48 @@ pub extern "system" fn Java_com_kmosync_KmoSyncJni_create(
         return 0;
     };
 
-    ffi::kmo_sync_create(
+    if callback.is_null() {
+        return 0;
+    }
+    let Ok(vm) = env.get_java_vm() else {
+        return 0;
+    };
+    let Ok(callback) = env.new_global_ref(callback) else {
+        return 0;
+    };
+    let callback_id = NEXT_CALLBACK_ID.fetch_add(1, Ordering::Relaxed);
+    let Ok(mut callbacks) = callback_registry().lock() else {
+        return 0;
+    };
+    callbacks.insert(callback_id, Arc::new(AndroidEventCallback { vm, callback }));
+    drop(callbacks);
+
+    let handle = ffi::kmo_sync_create(
         storage_config_json.as_ptr(),
         encryption_config_json.as_ptr(),
         device_id.as_ptr(),
         local_cache_dir.as_ptr(),
-        None,
-        ptr::null_mut(),
-    ) as jlong
+        Some(android_event_callback),
+        callback_id as *mut c_void,
+    );
+    if handle.is_null() {
+        if let Ok(mut callbacks) = callback_registry().lock() {
+            callbacks.remove(&callback_id);
+        }
+        return 0;
+    }
+    let Ok(mut handles) = ANDROID_HANDLE_CALLBACKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    else {
+        ffi::kmo_sync_destroy(handle);
+        if let Ok(mut callbacks) = callback_registry().lock() {
+            callbacks.remove(&callback_id);
+        }
+        return 0;
+    };
+    handles.insert(handle as usize, callback_id);
+    handle as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -47,6 +94,53 @@ pub extern "system" fn Java_com_kmosync_KmoSyncJni_destroy(
     handle: jlong,
 ) {
     ffi::kmo_sync_destroy(handle_to_ptr(handle));
+    if let Some(callback_id) = ANDROID_HANDLE_CALLBACKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|mut values| values.remove(&(handle as usize)))
+    {
+        if let Ok(mut callbacks) = callback_registry().lock() {
+            callbacks.remove(&callback_id);
+        }
+    }
+}
+
+static ANDROID_HANDLE_CALLBACKS: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn callback_registry() -> &'static Mutex<HashMap<usize, Arc<AndroidEventCallback>>> {
+    CALLBACKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+unsafe extern "C" fn android_event_callback(
+    event_type: i32,
+    json_data: *const c_char,
+    user_data: *mut c_void,
+) {
+    if json_data.is_null() {
+        return;
+    }
+    let callback = callback_registry()
+        .lock()
+        .ok()
+        .and_then(|callbacks| callbacks.get(&(user_data as usize)).cloned());
+    let Some(callback) = callback else {
+        return;
+    };
+    let Ok(mut env) = callback.vm.attach_current_thread() else {
+        return;
+    };
+    let json = unsafe { CStr::from_ptr(json_data) }.to_string_lossy();
+    let Ok(json) = env.new_string(json.as_ref()) else {
+        return;
+    };
+    let json_object = JObject::from(json);
+    let _ = env.call_method(
+        callback.callback.as_obj(),
+        "onEvent",
+        "(ILjava/lang/String;)V",
+        &[JValue::Int(event_type), JValue::Object(&json_object)],
+    );
 }
 
 #[unsafe(no_mangle)]

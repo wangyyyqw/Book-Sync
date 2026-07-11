@@ -42,7 +42,7 @@ int main(void) {
         "\"device_id\":\"device-a\","
         "\"progress\":{\"cfi_position\":\"epubcfi(/6/2)\",\"progress_percent\":0.5,\"chapter_id\":\"chapter-1\"},"
         "\"bookmarks\":[],"
-        "\"highlights\":[],"
+        "\"highlights\":[{\"highlight_id\":\"highlight-ffi-1\",\"cfi_start\":\"a\",\"cfi_end\":\"b\",\"color\":\"yellow\",\"comment\":\"restore me\",\"create_ts\":1}],"
         "\"notes\":[],"
         "\"wall_clock_ts\":1,"
         "\"logical_ts\":1,"
@@ -69,7 +69,7 @@ int main(void) {
         "meta-ffi-1",
         "highlight-ffi-1",
         "restore"
-    ) == KMO_ERR_CONFLICT);
+    ) == KMO_OK);
 
     char *err = kmo_sync_last_error(sync);
     assert(err != NULL);

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 const ENVELOPE_MAGIC: &[u8; 8] = b"KMOENV1\0";
+const ENVELOPE_STREAM_MAGIC: &[u8; 8] = b"KMOENV2\0";
 const HEADER_LEN_SIZE: usize = 4;
 const KEY_SIZE: usize = 32;
 const NONCE_SIZE: usize = 12;
@@ -15,6 +16,7 @@ const SALT_SIZE: usize = 16;
 const DEFAULT_ARGON2_M_COST: u32 = 19 * 1024;
 const DEFAULT_ARGON2_T_COST: u32 = 2;
 const DEFAULT_ARGON2_P_COST: u32 = 1;
+const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EnvelopeCrypto {
@@ -83,6 +85,10 @@ struct EnvelopeKdfHeader {
 }
 
 impl EnvelopeCrypto {
+    pub fn kek_version(&self) -> u32 {
+        self.kek_version
+    }
+
     pub fn from_passphrase(
         passphrase: impl Into<String>,
         kek_id: Option<String>,
@@ -221,6 +227,63 @@ impl EnvelopeCrypto {
         };
         encode_envelope(&new_header, &ciphertext[header_end..])
     }
+
+    pub fn rewrap_file(
+        &self,
+        new_crypto: &EnvelopeCrypto,
+        input: &std::path::Path,
+        output: &std::path::Path,
+    ) -> Result<()> {
+        use std::io::{BufReader, BufWriter, Read, Write};
+
+        let mut reader = BufReader::new(std::fs::File::open(input)?);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != ENVELOPE_MAGIC && &magic != ENVELOPE_STREAM_MAGIC {
+            return Err(SyncError::Crypto(
+                "invalid envelope ciphertext magic".to_string(),
+            ));
+        }
+        let mut header_len = [0u8; 4];
+        reader.read_exact(&mut header_len)?;
+        let mut header_json = vec![0u8; u32::from_be_bytes(header_len) as usize];
+        reader.read_exact(&mut header_json)?;
+        let header: EnvelopeHeader = serde_json::from_slice(&header_json)?;
+        let mut dek = unwrap_dek(self, &header)?;
+        let mut nonce = [0u8; NONCE_SIZE];
+        OsRng.fill_bytes(&mut nonce);
+        let (mut new_kek, salt) = new_crypto.derive_or_copy_kek(None)?;
+        let cipher = Aes256Gcm::new_from_slice(&new_kek)
+            .map_err(|_| SyncError::Crypto("invalid envelope kek".to_string()))?;
+        let edek = cipher
+            .encrypt(Nonce::from_slice(&nonce), dek.as_slice())
+            .map_err(|_| SyncError::Crypto("envelope dek wrapping failed".to_string()))?;
+        dek.zeroize();
+        new_kek.zeroize();
+        let (mode, kdf) = envelope_mode_and_kdf(new_crypto, salt)?;
+        let new_header = EnvelopeHeader {
+            version: header.version,
+            kek_id: new_crypto.kek_id.clone(),
+            kek_version: new_crypto.kek_version,
+            mode,
+            kdf,
+            edek_nonce_hex: hex::encode(nonce),
+            edek_hex: hex::encode(edek),
+            data_nonce_hex: header.data_nonce_hex,
+        };
+        let new_header_json = serde_json::to_vec(&new_header)?;
+        let mut writer = BufWriter::new(std::fs::File::create(output)?);
+        writer.write_all(if new_header.version == 2 {
+            ENVELOPE_STREAM_MAGIC
+        } else {
+            ENVELOPE_MAGIC
+        })?;
+        writer.write_all(&(new_header_json.len() as u32).to_be_bytes())?;
+        writer.write_all(&new_header_json)?;
+        std::io::copy(&mut reader, &mut writer)?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 impl CryptoProvider for EnvelopeCrypto {
@@ -293,7 +356,11 @@ impl CryptoProvider for EnvelopeCrypto {
 
         let mut kek = self.derive_or_copy_kek(Some(&header))?.0;
         let edek_nonce = fixed_nonce_from_hex(&header.edek_nonce_hex, "edek nonce")?;
-        let data_nonce = fixed_nonce_from_hex(&header.data_nonce_hex, "data nonce")?;
+        let data_nonce = if header.version == 1 {
+            Some(fixed_nonce_from_hex(&header.data_nonce_hex, "data nonce")?)
+        } else {
+            None
+        };
         let edek = hex::decode(&header.edek_hex)
             .map_err(|err| SyncError::Crypto(format!("invalid envelope edek: {err}")))?;
 
@@ -312,11 +379,117 @@ impl CryptoProvider for EnvelopeCrypto {
 
         let data_cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|_| SyncError::Crypto("invalid envelope dek".to_string()))?;
-        let plaintext = data_cipher
-            .decrypt(Nonce::from_slice(&data_nonce), &ciphertext[header_end..])
-            .map_err(|_| SyncError::Crypto("envelope data decryption failed".to_string()))?;
+        let plaintext = if header.version == 1 {
+            data_cipher
+                .decrypt(
+                    Nonce::from_slice(data_nonce.as_ref().expect("v1 nonce is present")),
+                    &ciphertext[header_end..],
+                )
+                .map_err(|_| SyncError::Crypto("envelope data decryption failed".to_string()))?
+        } else {
+            decrypt_stream_body(&data_cipher, &ciphertext[header_end..])?
+        };
         dek.zeroize();
         Ok(plaintext)
+    }
+
+    fn encrypt_file(&self, input: &std::path::Path, output: &std::path::Path) -> Result<()> {
+        use std::io::{BufReader, BufWriter, Read, Write};
+
+        let mut dek = [0u8; KEY_SIZE];
+        let mut edek_nonce = [0u8; NONCE_SIZE];
+        OsRng.fill_bytes(&mut dek);
+        OsRng.fill_bytes(&mut edek_nonce);
+        let (mut kek, salt) = self.derive_or_copy_kek(None)?;
+        let kek_cipher = Aes256Gcm::new_from_slice(&kek)
+            .map_err(|_| SyncError::Crypto("invalid envelope kek".to_string()))?;
+        let edek = kek_cipher
+            .encrypt(Nonce::from_slice(&edek_nonce), dek.as_slice())
+            .map_err(|_| SyncError::Crypto("envelope dek wrapping failed".to_string()))?;
+        kek.zeroize();
+        let (mode, kdf) = envelope_mode_and_kdf(self, salt)?;
+        let header = EnvelopeHeader {
+            version: 2,
+            kek_id: self.kek_id.clone(),
+            kek_version: self.kek_version,
+            mode,
+            kdf,
+            edek_nonce_hex: hex::encode(edek_nonce),
+            edek_hex: hex::encode(edek),
+            data_nonce_hex: String::new(),
+        };
+        let header_json = serde_json::to_vec(&header)?;
+        let header_len = u32::try_from(header_json.len())
+            .map_err(|_| SyncError::Crypto("envelope header is too large".to_string()))?;
+        let mut writer = BufWriter::new(std::fs::File::create(output)?);
+        writer.write_all(ENVELOPE_STREAM_MAGIC)?;
+        writer.write_all(&header_len.to_be_bytes())?;
+        writer.write_all(&header_json)?;
+        let cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|_| SyncError::Crypto("invalid envelope dek".to_string()))?;
+        let mut reader = BufReader::new(std::fs::File::open(input)?);
+        let mut buffer = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let mut nonce = [0u8; NONCE_SIZE];
+            OsRng.fill_bytes(&mut nonce);
+            let encrypted = cipher
+                .encrypt(Nonce::from_slice(&nonce), &buffer[..read])
+                .map_err(|_| SyncError::Crypto("envelope chunk encryption failed".to_string()))?;
+            writer.write_all(&(encrypted.len() as u32).to_be_bytes())?;
+            writer.write_all(&nonce)?;
+            writer.write_all(&encrypted)?;
+        }
+        dek.zeroize();
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn decrypt_file(&self, input: &std::path::Path, output: &std::path::Path) -> Result<()> {
+        use std::io::{BufReader, BufWriter, Read, Write};
+
+        let mut reader = BufReader::new(std::fs::File::open(input)?);
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if &magic != ENVELOPE_STREAM_MAGIC {
+            std::fs::write(output, self.decrypt(&std::fs::read(input)?)?)?;
+            return Ok(());
+        }
+        let mut length = [0u8; 4];
+        reader.read_exact(&mut length)?;
+        let mut header_json = vec![0u8; u32::from_be_bytes(length) as usize];
+        reader.read_exact(&mut header_json)?;
+        let header: EnvelopeHeader = serde_json::from_slice(&header_json)?;
+        let mut dek = unwrap_dek(self, &header)?;
+        let cipher = Aes256Gcm::new_from_slice(&dek)
+            .map_err(|_| SyncError::Crypto("invalid envelope dek".to_string()))?;
+        let mut writer = BufWriter::new(std::fs::File::create(output)?);
+        loop {
+            let mut chunk_len = [0u8; 4];
+            let read = reader.read(&mut chunk_len)?;
+            if read == 0 {
+                break;
+            }
+            if read != chunk_len.len() {
+                return Err(SyncError::Crypto(
+                    "truncated envelope chunk length".to_string(),
+                ));
+            }
+            let mut nonce = [0u8; NONCE_SIZE];
+            reader.read_exact(&mut nonce)?;
+            let mut encrypted = vec![0u8; u32::from_be_bytes(chunk_len) as usize];
+            reader.read_exact(&mut encrypted)?;
+            let plaintext = cipher
+                .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
+                .map_err(|_| SyncError::Crypto("envelope chunk decryption failed".to_string()))?;
+            writer.write_all(&plaintext)?;
+        }
+        dek.zeroize();
+        writer.flush()?;
+        Ok(())
     }
 
     fn is_encrypted(&self) -> bool {
@@ -330,6 +503,74 @@ impl CryptoProvider for EnvelopeCrypto {
     fn remote_extension(&self, original_ext: &str) -> String {
         format!("{original_ext}.env")
     }
+}
+
+fn envelope_mode_and_kdf(
+    crypto: &EnvelopeCrypto,
+    salt: Option<Vec<u8>>,
+) -> Result<(EnvelopeMode, Option<EnvelopeKdfHeader>)> {
+    match (&crypto.kek_material, salt) {
+        (KekMaterial::Raw(_), _) => Ok((EnvelopeMode::RawKek, None)),
+        (KekMaterial::Passphrase(_), Some(salt)) => Ok((
+            EnvelopeMode::Argon2id,
+            Some(EnvelopeKdfHeader {
+                salt_hex: hex::encode(salt),
+                memory_cost: crypto.kdf_params.memory_cost,
+                time_cost: crypto.kdf_params.time_cost,
+                parallelism: crypto.kdf_params.parallelism,
+            }),
+        )),
+        (KekMaterial::Passphrase(_), None) => Err(SyncError::Crypto(
+            "envelope passphrase encryption missing salt".to_string(),
+        )),
+    }
+}
+
+fn unwrap_dek(crypto: &EnvelopeCrypto, header: &EnvelopeHeader) -> Result<Vec<u8>> {
+    let mut kek = crypto.derive_or_copy_kek(Some(header))?.0;
+    let nonce = fixed_nonce_from_hex(&header.edek_nonce_hex, "edek nonce")?;
+    let encrypted = hex::decode(&header.edek_hex)
+        .map_err(|err| SyncError::Crypto(format!("invalid envelope edek: {err}")))?;
+    let cipher = Aes256Gcm::new_from_slice(&kek)
+        .map_err(|_| SyncError::Crypto("invalid envelope kek".to_string()))?;
+    let dek = cipher
+        .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
+        .map_err(|_| SyncError::Crypto("envelope dek unwrap failed".to_string()))?;
+    kek.zeroize();
+    if dek.len() != KEY_SIZE {
+        return Err(SyncError::Crypto(
+            "envelope dek has invalid length".to_string(),
+        ));
+    }
+    Ok(dek)
+}
+
+fn decrypt_stream_body(cipher: &Aes256Gcm, body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::{Cursor, Read};
+    let mut reader = Cursor::new(body);
+    let mut output = Vec::new();
+    loop {
+        let mut length = [0u8; 4];
+        let read = reader.read(&mut length)?;
+        if read == 0 {
+            break;
+        }
+        if read != length.len() {
+            return Err(SyncError::Crypto(
+                "truncated envelope chunk length".to_string(),
+            ));
+        }
+        let mut nonce = [0u8; NONCE_SIZE];
+        reader.read_exact(&mut nonce)?;
+        let mut encrypted = vec![0u8; u32::from_be_bytes(length) as usize];
+        reader.read_exact(&mut encrypted)?;
+        output.extend_from_slice(
+            &cipher
+                .decrypt(Nonce::from_slice(&nonce), encrypted.as_slice())
+                .map_err(|_| SyncError::Crypto("envelope chunk decryption failed".to_string()))?,
+        );
+    }
+    Ok(output)
 }
 
 fn normalized_kek_id(kek_id: Option<String>) -> String {
@@ -347,7 +588,8 @@ fn parse_envelope(ciphertext: &[u8]) -> Result<(EnvelopeHeader, usize)> {
             "envelope ciphertext is too short".to_string(),
         ));
     }
-    if &ciphertext[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC {
+    let magic = &ciphertext[..ENVELOPE_MAGIC.len()];
+    if magic != ENVELOPE_MAGIC && magic != ENVELOPE_STREAM_MAGIC {
         return Err(SyncError::Crypto(
             "invalid envelope ciphertext magic".to_string(),
         ));
@@ -369,7 +611,7 @@ fn parse_envelope(ciphertext: &[u8]) -> Result<(EnvelopeHeader, usize)> {
     }
 
     let header: EnvelopeHeader = serde_json::from_slice(&ciphertext[header_len_end..header_end])?;
-    if header.version != 1 {
+    if header.version != 1 && header.version != 2 {
         return Err(SyncError::Crypto(format!(
             "unsupported envelope version {}",
             header.version
@@ -385,7 +627,11 @@ fn encode_envelope(header: &EnvelopeHeader, encrypted_body: &[u8]) -> Result<Vec
     let mut output = Vec::with_capacity(
         ENVELOPE_MAGIC.len() + HEADER_LEN_SIZE + header_json.len() + encrypted_body.len(),
     );
-    output.extend_from_slice(ENVELOPE_MAGIC);
+    output.extend_from_slice(if header.version == 2 {
+        ENVELOPE_STREAM_MAGIC
+    } else {
+        ENVELOPE_MAGIC
+    });
     output.extend_from_slice(&header_len.to_be_bytes());
     output.extend_from_slice(&header_json);
     output.extend_from_slice(encrypted_body);
@@ -501,5 +747,55 @@ mod tests {
         assert_eq!(old_body, new_body);
         assert!(old_crypto.decrypt(&rewrapped).is_err());
         assert_eq!(new_crypto.decrypt(&rewrapped).unwrap(), b"rotate me");
+    }
+
+    #[test]
+    fn envelope_stream_file_roundtrip() {
+        let crypto =
+            EnvelopeCrypto::from_passphrase("stream-pass", None, None, Some(test_kdf_params()))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.epub");
+        let encrypted = dir.path().join("source.env");
+        let output = dir.path().join("output.epub");
+        let bytes: Vec<u8> = (0..(3 * STREAM_CHUNK_SIZE + 17))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        crypto.encrypt_file(&source, &encrypted).unwrap();
+        crypto.decrypt_file(&encrypted, &output).unwrap();
+        assert_eq!(std::fs::read(output).unwrap(), bytes);
+    }
+
+    #[test]
+    fn envelope_stream_file_can_be_rewrapped_without_loading_the_body() {
+        let old = EnvelopeCrypto::from_passphrase(
+            "old-stream-pass",
+            None,
+            Some(1),
+            Some(test_kdf_params()),
+        )
+        .unwrap();
+        let new = EnvelopeCrypto::from_passphrase(
+            "new-stream-pass",
+            None,
+            Some(2),
+            Some(test_kdf_params()),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let encrypted = dir.path().join("old.env");
+        let rewrapped = dir.path().join("new.env");
+        let output = dir.path().join("output");
+        std::fs::write(&source, vec![42u8; STREAM_CHUNK_SIZE + 9]).unwrap();
+        old.encrypt_file(&source, &encrypted).unwrap();
+        old.rewrap_file(&new, &encrypted, &rewrapped).unwrap();
+        assert!(old.decrypt_file(&rewrapped, &output).is_err());
+        new.decrypt_file(&rewrapped, &output).unwrap();
+        assert_eq!(
+            std::fs::read(output).unwrap(),
+            vec![42u8; STREAM_CHUNK_SIZE + 9]
+        );
     }
 }

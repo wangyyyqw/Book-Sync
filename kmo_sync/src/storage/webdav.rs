@@ -1,12 +1,12 @@
-use super::{RemoteFileInfo, RemoteStorage};
+use super::{RemoteFileInfo, RemoteStorage, RemoteVersion, VersionedObject};
 use crate::{Result, SyncError};
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode, Url};
-use std::io::Cursor;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
 #[derive(Debug, Clone)]
 pub struct WebDavConfig {
@@ -219,6 +219,33 @@ impl RemoteStorage for WebDavStorage {
         ))
     }
 
+    async fn read_object_versioned(&self, remote_path: &str) -> Result<Option<VersionedObject>> {
+        let response = self
+            .send_with_retry("GET", || {
+                Ok(self.apply_auth(self.client.get(self.url_for_remote_path(remote_path)?)))
+            })
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(http_status_error(response.status(), "GET"));
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let data = response.bytes().await.map_err(map_reqwest_error)?.to_vec();
+        Ok(Some(VersionedObject {
+            data,
+            version: RemoteVersion {
+                etag,
+                version: None,
+            },
+        }))
+    }
+
     async fn write_object(&self, remote_path: &str, data: &[u8]) -> Result<()> {
         self.ensure_parent_dirs(remote_path).await?;
         let response = self
@@ -234,6 +261,43 @@ impl RemoteStorage for WebDavStorage {
             Ok(())
         } else {
             Err(http_status_error(response.status(), "PUT"))
+        }
+    }
+
+    async fn write_object_conditional(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        self.ensure_parent_dirs(remote_path).await?;
+        let expected_etag = match expected {
+            None => None,
+            Some(version) => Some(version.etag.as_deref().ok_or_else(|| {
+                SyncError::Storage(
+                    "WebDAV server did not provide an ETag required for safe concurrent sync"
+                        .to_string(),
+                )
+            })?),
+        };
+        let response = self
+            .send_with_retry("conditional PUT", || {
+                let request = self
+                    .client
+                    .put(self.url_for_remote_path(remote_path)?)
+                    .body(data.to_vec());
+                let request = if let Some(etag) = expected_etag {
+                    request.header(reqwest::header::IF_MATCH, etag)
+                } else {
+                    request.header(reqwest::header::IF_NONE_MATCH, "*")
+                };
+                Ok(self.apply_auth(request))
+            })
+            .await?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            StatusCode::PRECONDITION_FAILED | StatusCode::CONFLICT => Ok(false),
+            status => Err(http_status_error(status, "conditional PUT")),
         }
     }
 
@@ -314,17 +378,38 @@ impl RemoteStorage for WebDavStorage {
     async fn upload_large(
         &self,
         remote_path: &str,
-        mut stream: Box<dyn AsyncRead + Unpin + Send>,
+        stream: Box<dyn AsyncRead + Unpin + Send>,
         _total_size: u64,
     ) -> Result<()> {
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await?;
-        self.write_object(remote_path, &bytes).await
+        self.ensure_parent_dirs(remote_path).await?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(stream));
+        let response = self
+            .apply_auth(
+                self.client
+                    .put(self.url_for_remote_path(remote_path)?)
+                    .body(body),
+            )
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(http_status_error(response.status(), "streaming PUT"))
+        }
     }
 
     async fn download_large(&self, remote_path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>> {
-        let bytes = self.read_object(remote_path).await?;
-        Ok(Box::new(Cursor::new(bytes)))
+        let response = self
+            .apply_auth(self.client.get(self.url_for_remote_path(remote_path)?))
+            .send()
+            .await
+            .map_err(map_reqwest_error)?;
+        if !response.status().is_success() {
+            return Err(http_status_error(response.status(), "streaming GET"));
+        }
+        let stream = response.bytes_stream().map_err(std::io::Error::other);
+        Ok(Box::new(tokio_util::io::StreamReader::new(stream)))
     }
 }
 

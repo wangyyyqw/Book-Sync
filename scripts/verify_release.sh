@@ -4,6 +4,8 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 CRATE_DIR="$ROOT_DIR/kmo_sync"
 NATIVE_LIB_DIR="$CRATE_DIR/target/release"
+ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
+export ANDROID_HOME
 
 cd "$CRATE_DIR"
 cargo fmt --check

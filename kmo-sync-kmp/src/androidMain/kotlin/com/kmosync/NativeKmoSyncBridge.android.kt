@@ -7,16 +7,19 @@ internal actual class NativeKmoSyncBridge actual constructor(
     emitEvent: (SyncEvent) -> Unit,
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
+    private val nativeEventCallback = NativeEventCallback { eventType, json ->
+        emitEvent(SyncEvent(SyncEventType.fromWireValue(eventType), eventType, json))
+    }
     private val handle: Long = KmoSyncJni.create(
         config.storageConfigJson,
         config.encryptionConfigJson,
         config.deviceId,
         config.localCacheDir,
+        nativeEventCallback,
     )
 
     init {
         require(handle != 0L) { "kmo_sync_create returned null" }
-        emitEvent
     }
 
     actual fun syncAll(mode: Int): Int = KmoSyncJni.syncAll(handle, mode)
@@ -85,6 +88,7 @@ private object KmoSyncJni {
         encryptionConfigJson: String,
         deviceId: String,
         localCacheDir: String,
+        callback: NativeEventCallback,
     ): Long
 
     external fun destroy(handle: Long)
@@ -116,4 +120,8 @@ private object KmoSyncJni {
     external fun pause(handle: Long): Int
     external fun resume(handle: Long): Int
     external fun lastError(handle: Long): String
+}
+
+private fun interface NativeEventCallback {
+    fun onEvent(eventType: Int, json: String)
 }

@@ -34,6 +34,8 @@ pub struct Tombstone {
     pub deleted_at_wall_ts: i64,
     pub deleted_by_device: String,
     pub grace_period_days: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_item_json: Option<String>,
 }
 
 impl Tombstone {
@@ -50,6 +52,7 @@ impl Tombstone {
             deleted_at_wall_ts: now_millis(),
             deleted_by_device: device_id,
             grace_period_days: DEFAULT_GRACE_PERIOD_DAYS,
+            deleted_item_json: None,
         }
     }
 
@@ -178,8 +181,7 @@ impl TombstoneSet {
             .collect();
         self.tombstones.retain(|item| !item.is_expired(now));
         // tombstone 过期后，对应的 revival 也没有意义了
-        self.revivals
-            .retain(|r| !expired_uuids.contains(&r.uuid));
+        self.revivals.retain(|r| !expired_uuids.contains(&r.uuid));
         let removed = initial_len - self.tombstones.len();
         if removed > 0 {
             self.last_modified_ts = now;

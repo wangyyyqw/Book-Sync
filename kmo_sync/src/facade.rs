@@ -9,6 +9,7 @@ use crate::model::{
     encode_meta, meta_hash,
 };
 use crate::storage::RemoteStorage;
+use crate::storage::RemoteVersion;
 use crate::storage::file::FileStorage;
 use crate::storage::s3::{S3Config, S3Storage};
 use crate::storage::webdav::{WebDavConfig, WebDavStorage};
@@ -72,6 +73,8 @@ pub struct KmoSyncFacade {
     runtime: tokio::runtime::Runtime,
     events: EventEmitter,
     scheduler: Mutex<SchedulerState>,
+    active_remote_namespace: Mutex<Option<String>>,
+    operation_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -161,6 +164,17 @@ struct RemoteBookmarks {
     last_write_ts: i64,
 }
 
+struct VersionedRemote<T> {
+    value: Option<T>,
+    version: Option<RemoteVersion>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ActiveRemoteNamespace {
+    namespace: String,
+    requires_envelope_encryption: bool,
+}
+
 impl KmoSyncFacade {
     fn crypto(&self) -> Arc<dyn CryptoProvider> {
         self.crypto.lock().expect("crypto mutex poisoned").clone()
@@ -210,10 +224,16 @@ impl KmoSyncFacade {
             runtime,
             events,
             scheduler: Mutex::new(SchedulerState::default()),
+            active_remote_namespace: Mutex::new(None),
+            operation_lock: Mutex::new(()),
         })
     }
 
     pub fn sync_all(&self, mode: i32) -> Result<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
         let mode = SyncMode::try_from(mode)?;
         self.events.emit(
             EventType::SyncStart,
@@ -232,12 +252,12 @@ impl KmoSyncFacade {
     }
 
     pub fn sync_single_meta(&self, book_hash: &str, meta_id: &str) -> Result<()> {
-        if book_hash.trim().is_empty() {
-            return Err(SyncError::InvalidArg("book_hash is empty".to_string()));
-        }
-        if meta_id.trim().is_empty() {
-            return Err(SyncError::InvalidArg("meta_id is empty".to_string()));
-        }
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
+        validate_identifier(book_hash, "book_hash")?;
+        validate_identifier(meta_id, "meta_id")?;
         self.events.emit(
             EventType::SyncStart,
             &serde_json::json!({
@@ -267,9 +287,11 @@ impl KmoSyncFacade {
     }
 
     pub fn sync_book(&self, book_hash: &str) -> Result<()> {
-        if book_hash.trim().is_empty() {
-            return Err(SyncError::InvalidArg("book_hash is empty".to_string()));
-        }
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
+        validate_identifier(book_hash, "book_hash")?;
         let decision = self.blob_policy_decision()?;
         if !decision.allowed {
             return Err(SyncError::Network(format!(
@@ -337,9 +359,7 @@ impl KmoSyncFacade {
     }
 
     pub fn put_local_book(&self, book_hash: &str, local_file_path: &Path) -> Result<()> {
-        if book_hash.trim().is_empty() {
-            return Err(SyncError::InvalidArg("book_hash is empty".to_string()));
-        }
+        validate_identifier(book_hash, "book_hash")?;
         if !local_file_path.is_file() {
             return Err(SyncError::InvalidArg(format!(
                 "local_file_path is not a file: {}",
@@ -363,9 +383,7 @@ impl KmoSyncFacade {
     }
 
     pub fn get_local_meta_json(&self, meta_id: &str) -> Result<String> {
-        if meta_id.trim().is_empty() {
-            return Err(SyncError::InvalidArg("meta_id is empty".to_string()));
-        }
+        validate_identifier(meta_id, "meta_id")?;
 
         match self.read_local_meta_priv(meta_id)? {
             Some(meta) => Ok(serde_json::to_string(&meta)?),
@@ -377,6 +395,8 @@ impl KmoSyncFacade {
     }
 
     pub fn put_local_meta(&self, meta: &BookReadingMeta) -> Result<()> {
+        validate_identifier(&meta.meta_id, "meta_id")?;
+        validate_identifier(&meta.book_hash, "book_hash")?;
         let meta = self.meta_with_archived_history(meta)?;
         let bytes = encode_meta(&meta)?;
         let path = self.local_meta_path(&meta.meta_id);
@@ -388,6 +408,7 @@ impl KmoSyncFacade {
     }
 
     pub fn read_local_meta(&self, meta_id: &str) -> Result<Option<BookReadingMeta>> {
+        validate_identifier(meta_id, "meta_id")?;
         self.read_local_meta_priv(meta_id)
     }
 
@@ -396,6 +417,10 @@ impl KmoSyncFacade {
     }
 
     pub fn resolve_meta_conflict(&self, meta_id: &str, chosen_version: &str) -> Result<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
         if meta_id.trim().is_empty() {
             return Err(SyncError::InvalidArg("meta_id is empty".to_string()));
         }
@@ -421,8 +446,11 @@ impl KmoSyncFacade {
                 let meta = self.read_local_meta(meta_id)?.ok_or_else(|| {
                     SyncError::InvalidArg(format!("no local meta cached for {meta_id}"))
                 })?;
-                self.runtime.block_on(self.write_remote_progress(&meta))?;
-                self.runtime.block_on(self.write_remote_bookmarks(&meta))?;
+                self.runtime.block_on(self.sync_single_meta_inner(
+                    &meta.book_hash,
+                    meta_id,
+                    SyncMode::PullOnly,
+                ))?;
                 self.events.emit(
                     EventType::SyncProgress,
                     &serde_json::json!({
@@ -488,6 +516,7 @@ impl KmoSyncFacade {
         let mut meta = self
             .read_local_meta(meta_id)?
             .ok_or_else(|| SyncError::InvalidArg(format!("local meta not found: {meta_id}")))?;
+        let deleted_item_json = snapshot_meta_item(&meta, &item_type, item_uuid)?;
         remove_meta_item(&mut meta, &item_type, item_uuid);
         meta.logical_ts += 1;
         meta.modified_ts = meta.modified_ts.max(meta.logical_ts);
@@ -503,12 +532,14 @@ impl KmoSyncFacade {
         if local_tombstones.exists() {
             set = TombstoneSet::decode(&std::fs::read(&local_tombstones)?)?;
         }
-        set.mark_deleted(Tombstone::new(
+        let mut tombstone = Tombstone::new(
             item_uuid.to_string(),
             item_type,
             meta.logical_ts,
             self.device_id().to_string(),
-        ));
+        );
+        tombstone.deleted_item_json = Some(deleted_item_json);
+        set.mark_deleted(tombstone);
         set.gc_expired();
         self.write_local_tombstones(meta_id, &set)?;
         self.events.emit(
@@ -529,7 +560,7 @@ impl KmoSyncFacade {
         if item_uuid.trim().is_empty() {
             return Err(SyncError::InvalidArg("item_uuid is empty".to_string()));
         }
-        let _meta = self
+        let mut meta = self
             .read_local_meta(meta_id)?
             .ok_or_else(|| SyncError::InvalidArg(format!("local meta not found: {meta_id}")))?;
         let mut set = TombstoneSet::default();
@@ -538,21 +569,25 @@ impl KmoSyncFacade {
             set = TombstoneSet::decode(&std::fs::read(&local_path)?)?;
         }
         // 找到要撤销的 tombstone，提取 item_type 和 deleted_at_logical_ts
-        let tombstone_info = set
+        let tombstone = set
             .tombstones
             .iter()
             .find(|t| t.uuid == item_uuid)
-            .map(|t| (t.item_type, t.deleted_at_logical_ts));
-        let (item_type, deleted_at_logical_ts) = tombstone_info.ok_or_else(|| {
-            SyncError::InvalidArg(format!("tombstone not found: {item_uuid}"))
-        })?;
+            .cloned()
+            .ok_or_else(|| SyncError::InvalidArg(format!("tombstone not found: {item_uuid}")))?;
+        restore_meta_item(&mut meta, &tombstone)?;
+        meta.logical_ts = meta.logical_ts.max(tombstone.deleted_at_logical_ts) + 1;
+        meta.modified_ts = meta.modified_ts.max(meta.logical_ts);
+        meta.wall_clock_ts = now_millis();
+        meta.device_id = self.device_id().to_string();
+        self.put_local_meta(&meta)?;
         // 移除本地 tombstone
         set.revive(item_uuid);
         // 记录 revival，使远端的同名 tombstone 在过滤时不生效
         set.add_revival(Revival {
             uuid: item_uuid.to_string(),
-            item_type,
-            revived_at_logical_ts: deleted_at_logical_ts + 1,
+            item_type: tombstone.item_type,
+            revived_at_logical_ts: meta.logical_ts,
             revived_at_wall_ts: now_millis(),
             revived_by_device: self.device_id().to_string(),
         });
@@ -659,6 +694,10 @@ impl KmoSyncFacade {
     }
 
     pub fn resolve_blob_conflict(&self, book_hash: &str, chosen_version: &str) -> Result<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
         if book_hash.trim().is_empty() {
             return Err(SyncError::InvalidArg("book_hash is empty".to_string()));
         }
@@ -719,6 +758,10 @@ impl KmoSyncFacade {
     }
 
     pub fn rotate_envelope_kek(&self, new_encryption_config_json: &str) -> Result<usize> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
         let new_encryption: EncryptionConfigJson =
             validate_json(new_encryption_config_json, "new_encryption_config_json")?;
         if !encryption_type_is_envelope(&new_encryption) {
@@ -859,6 +902,7 @@ impl KmoSyncFacade {
     }
 
     async fn sync_all_inner(&self, mode: SyncMode) -> Result<()> {
+        self.refresh_active_remote_namespace().await?;
         let meta_pairs = self.discover_meta_pairs(mode).await?;
         for (book_hash, meta_id) in meta_pairs {
             self.sync_single_meta_inner(&book_hash, &meta_id, mode)
@@ -922,19 +966,68 @@ impl KmoSyncFacade {
         old_crypto: &EnvelopeCrypto,
         new_crypto: &EnvelopeCrypto,
     ) -> Result<usize> {
+        self.refresh_active_remote_namespace().await?;
         let mut remote_paths = Vec::new();
         for prefix in ["book_progress", "bookmarks", "books", "tombstones"] {
-            for info in self.storage.list_prefix(prefix).await? {
-                remote_paths.push(info.path);
+            let active_prefix = self.active_remote_path(prefix);
+            for info in self.storage.list_prefix(&active_prefix).await? {
+                if let Some(logical) = self.strip_active_remote_path(&info.path) {
+                    remote_paths.push((logical, info.path));
+                }
             }
         }
+        let namespace = format!("kek-v{}-{}", new_crypto.kek_version(), now_millis());
         let mut rewrapped = 0usize;
-        for path in remote_paths {
-            let encrypted = self.storage.read_object(&path).await?;
-            let rotated = old_crypto.rewrap_ciphertext(new_crypto, &encrypted)?;
-            self.storage.write_object(&path, &rotated).await?;
+        for (logical_path, active_path) in remote_paths {
+            let input = self.transfer_path("rewrap-input");
+            let output = self.transfer_path("rewrap-output");
+            if let Some(parent) = input.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut remote = self.storage.download_large(&active_path).await?;
+            let mut local = tokio::fs::File::create(&input).await?;
+            tokio::io::copy(&mut remote, &mut local).await?;
+            drop(local);
+            old_crypto.rewrap_file(new_crypto, &input, &output)?;
+            let size = std::fs::metadata(&output)?.len();
+            let output_file = tokio::fs::File::open(&output).await?;
+            let upload_result = self
+                .storage
+                .upload_large(
+                    &format!("{namespace}/{logical_path}"),
+                    Box::new(output_file),
+                    size,
+                )
+                .await;
+            let _ = std::fs::remove_file(input);
+            let _ = std::fs::remove_file(output);
+            upload_result?;
             rewrapped += 1;
         }
+        let marker_path = "_active_namespace.json";
+        let marker = self.storage.read_object_versioned(marker_path).await?;
+        let payload = serde_json::to_vec(&ActiveRemoteNamespace {
+            namespace: namespace.clone(),
+            requires_envelope_encryption: true,
+        })?;
+        if !self
+            .storage
+            .write_object_conditional(
+                marker_path,
+                &payload,
+                marker.as_ref().map(|value| &value.version),
+            )
+            .await?
+        {
+            return Err(SyncError::Conflict(
+                "another device changed the active encryption namespace".to_string(),
+            ));
+        }
+        *self
+            .active_remote_namespace
+            .lock()
+            .map_err(|_| SyncError::Internal("namespace mutex poisoned".to_string()))? =
+            Some(namespace);
         Ok(rewrapped)
     }
 
@@ -944,6 +1037,30 @@ impl KmoSyncFacade {
         meta_id: &str,
         mode: SyncMode,
     ) -> Result<()> {
+        validate_identifier(book_hash, "book_hash")?;
+        validate_identifier(meta_id, "meta_id")?;
+        self.refresh_active_remote_namespace().await?;
+        const MAX_CAS_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            if self
+                .sync_single_meta_attempt(book_hash, meta_id, mode)
+                .await?
+            {
+                return Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(SyncError::Conflict(format!(
+            "metadata kept changing while syncing book {book_hash}"
+        )))
+    }
+
+    async fn sync_single_meta_attempt(
+        &self,
+        book_hash: &str,
+        meta_id: &str,
+        mode: SyncMode,
+    ) -> Result<bool> {
         let _ = self.remote_progress_path(book_hash);
         let _ = self.remote_bookmarks_path(book_hash);
 
@@ -953,26 +1070,29 @@ impl KmoSyncFacade {
             None
         };
 
+        let versioned_progress = self.read_remote_progress(book_hash).await?;
+        let versioned_bookmarks = self.read_remote_bookmarks(book_hash).await?;
         let remote_progress = if mode != SyncMode::PushOnly {
-            self.read_remote_progress(book_hash).await?
+            versioned_progress.value.as_ref()
         } else {
             None
         };
         let remote_bookmarks = if mode != SyncMode::PushOnly {
-            self.read_remote_bookmarks(book_hash).await?
+            versioned_bookmarks.value.as_ref()
         } else {
             None
         };
 
         // --- Tombstone 同步：读本地 + 远端，合并后用于过滤已删除条目 ---
         let local_tombstones = self.read_local_tombstones(meta_id)?;
+        let versioned_tombstones = self.read_remote_tombstones(book_hash).await?;
         let remote_tombstones = if mode != SyncMode::PushOnly {
-            self.read_remote_tombstones(book_hash).await?
+            versioned_tombstones.value.as_ref()
         } else {
             None
         };
         let mut merged_tombstones = local_tombstones.clone();
-        if let Some(rt) = &remote_tombstones {
+        if let Some(rt) = remote_tombstones {
             merged_tombstones.merge(rt.clone());
         }
         merged_tombstones.gc_expired();
@@ -981,20 +1101,24 @@ impl KmoSyncFacade {
         if tombstone_local_changed {
             self.write_local_tombstones(meta_id, &merged_tombstones)?;
         }
-        let tombstone_remote_changed = match &remote_tombstones {
+        let tombstone_remote_changed = match remote_tombstones {
             None => !merged_tombstones.is_empty(),
             Some(rt) => rt != &merged_tombstones,
         };
-        if tombstone_remote_changed && mode != SyncMode::PullOnly {
-            self.write_remote_tombstones(book_hash, &merged_tombstones)
-                .await?;
+        if tombstone_remote_changed
+            && mode != SyncMode::PullOnly
+            && !self
+                .write_remote_tombstones_conditional(
+                    book_hash,
+                    &merged_tombstones,
+                    versioned_tombstones.version.as_ref(),
+                )
+                .await?
+        {
+            return Ok(false);
         }
 
-        let mut merged = merge_meta_with_remote(
-            local.clone(),
-            remote_progress.as_ref(),
-            remote_bookmarks.as_ref(),
-        );
+        let mut merged = merge_meta_with_remote(local.clone(), remote_progress, remote_bookmarks);
 
         // Keep book_hash / meta_id / origin_device_id populated so the meta
         // stays reachable by the caller's id slot. The new protocol stores
@@ -1006,32 +1130,47 @@ impl KmoSyncFacade {
             merged.meta_id = meta_id.to_string();
         }
         if merged.origin_device_id.is_empty() {
-            merged.origin_device_id = book_hash.to_string();
+            merged.origin_device_id = if merged.device_id.is_empty() {
+                self.device_id().to_string()
+            } else {
+                merged.device_id.clone()
+            };
         }
 
         // 用合并后的 tombstone 过滤已删除条目（已被 revival 撤销的保留）
         Self::apply_tombstones_to_meta(&mut merged, &merged_tombstones);
 
-        let remote_matches = remote_progress_matches(&merged, remote_progress.as_ref())
-            && remote_bookmarks_matches(&merged, remote_bookmarks.as_ref());
+        let remote_matches = remote_progress_matches(&merged, remote_progress)
+            && remote_bookmarks_matches(&merged, remote_bookmarks);
         let local_matches = local.as_ref() == Some(&merged);
+
+        if !remote_matches && mode != SyncMode::PullOnly {
+            if !progress_matches_remote(&merged, remote_progress)
+                && !self
+                    .write_remote_progress_conditional(&merged, versioned_progress.version.as_ref())
+                    .await?
+            {
+                return Ok(false);
+            }
+            if !bookmarks_matches_remote(&merged, remote_bookmarks)
+                && !self
+                    .write_remote_bookmarks_conditional(
+                        &merged,
+                        versioned_bookmarks.version.as_ref(),
+                    )
+                    .await?
+            {
+                return Ok(false);
+            }
+        }
 
         if !local_matches && mode != SyncMode::PushOnly {
             self.put_local_meta(&merged)?;
         }
 
-        if !remote_matches && mode != SyncMode::PullOnly {
-            if !progress_matches_remote(&merged, remote_progress.as_ref()) {
-                self.write_remote_progress(&merged).await?;
-            }
-            if !bookmarks_matches_remote(&merged, remote_bookmarks.as_ref()) {
-                self.write_remote_bookmarks(&merged).await?;
-            }
-        }
-
         let hash = hex::encode(meta_hash(&merged)?);
         self.upsert_meta_index(&merged, hash, merged.modified_ts)?;
-        Ok(())
+        Ok(true)
     }
 
     /// 用 tombstone set 过滤 meta 中已删除且未被 revive 的条目。
@@ -1061,13 +1200,62 @@ impl KmoSyncFacade {
         format!("books/{book_hash}")
     }
 
+    async fn refresh_active_remote_namespace(&self) -> Result<()> {
+        let namespace = match self
+            .storage
+            .read_object_optional("_active_namespace.json")
+            .await?
+        {
+            Some(bytes) => {
+                let marker: ActiveRemoteNamespace = serde_json::from_slice(&bytes)?;
+                validate_identifier(&marker.namespace, "active namespace")?;
+                if marker.requires_envelope_encryption && !self.crypto().uses_envelope_encryption()
+                {
+                    return Err(SyncError::Crypto(
+                        "remote namespace requires envelope encryption".to_string(),
+                    ));
+                }
+                Some(marker.namespace)
+            }
+            None => None,
+        };
+        *self
+            .active_remote_namespace
+            .lock()
+            .map_err(|_| SyncError::Internal("namespace mutex poisoned".to_string()))? = namespace;
+        Ok(())
+    }
+
+    fn active_remote_path(&self, logical_path: &str) -> String {
+        self.active_remote_namespace
+            .lock()
+            .ok()
+            .and_then(|namespace| namespace.clone())
+            .map(|namespace| format!("{namespace}/{logical_path}"))
+            .unwrap_or_else(|| logical_path.to_string())
+    }
+
+    fn strip_active_remote_path(&self, path: &str) -> Option<String> {
+        let namespace = self
+            .active_remote_namespace
+            .lock()
+            .ok()
+            .and_then(|namespace| namespace.clone());
+        match namespace {
+            Some(namespace) => path
+                .strip_prefix(&format!("{namespace}/"))
+                .map(str::to_string),
+            None => Some(path.to_string()),
+        }
+    }
+
     fn remote_book_path(&self, book_hash: &str) -> String {
         // remote_extension returns "" for plaintext, ".enc" for age, ".env" for envelope.
         let ext = self.crypto().remote_extension("");
         if ext.is_empty() {
-            format!("books/{book_hash}")
+            self.active_remote_path(&format!("books/{book_hash}"))
         } else {
-            format!("books/{book_hash}{ext}")
+            self.active_remote_path(&format!("books/{book_hash}{ext}"))
         }
     }
 
@@ -1077,33 +1265,33 @@ impl KmoSyncFacade {
         // For envelope: "book_progress/<hash>.json.env"
         let ext = self.crypto().remote_extension("json");
         if ext == "json" {
-            format!("book_progress/{book_hash}.json")
+            self.active_remote_path(&format!("book_progress/{book_hash}.json"))
         } else if let Some(stripped) = ext.strip_prefix("json.") {
-            format!("book_progress/{book_hash}.json.{stripped}")
+            self.active_remote_path(&format!("book_progress/{book_hash}.json.{stripped}"))
         } else {
-            format!("book_progress/{book_hash}.json{ext}")
+            self.active_remote_path(&format!("book_progress/{book_hash}.json{ext}"))
         }
     }
 
     fn remote_bookmarks_path(&self, book_hash: &str) -> String {
         let ext = self.crypto().remote_extension("json");
         if ext == "json" {
-            format!("bookmarks/{book_hash}.json")
+            self.active_remote_path(&format!("bookmarks/{book_hash}.json"))
         } else if let Some(stripped) = ext.strip_prefix("json.") {
-            format!("bookmarks/{book_hash}.json.{stripped}")
+            self.active_remote_path(&format!("bookmarks/{book_hash}.json.{stripped}"))
         } else {
-            format!("bookmarks/{book_hash}.json{ext}")
+            self.active_remote_path(&format!("bookmarks/{book_hash}.json{ext}"))
         }
     }
 
     fn remote_tombstones_path(&self, book_hash: &str) -> String {
         let ext = self.crypto().remote_extension("json");
         if ext == "json" {
-            format!("tombstones/{book_hash}.json")
+            self.active_remote_path(&format!("tombstones/{book_hash}.json"))
         } else if let Some(stripped) = ext.strip_prefix("json.") {
-            format!("tombstones/{book_hash}.json.{stripped}")
+            self.active_remote_path(&format!("tombstones/{book_hash}.json.{stripped}"))
         } else {
-            format!("tombstones/{book_hash}.json{ext}")
+            self.active_remote_path(&format!("tombstones/{book_hash}.json{ext}"))
         }
     }
 
@@ -1122,13 +1310,24 @@ impl KmoSyncFacade {
             .await
     }
 
-    async fn read_remote_progress(&self, book_hash: &str) -> Result<Option<RemoteProgress>> {
+    async fn read_remote_progress(
+        &self,
+        book_hash: &str,
+    ) -> Result<VersionedRemote<RemoteProgress>> {
         let path = self.remote_progress_path(book_hash);
-        let Some(encrypted) = self.storage.read_object_optional(&path).await? else {
-            return Ok(None);
+        let Some(object) = self.storage.read_object_versioned(&path).await? else {
+            return Ok(VersionedRemote {
+                value: None,
+                version: None,
+            });
         };
-        let bytes = self.crypto().decrypt(&encrypted)?;
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        let bytes = self.crypto().decrypt(&object.data)?;
+        let value: RemoteProgress = serde_json::from_slice(&bytes)?;
+        validate_remote_object(value.schema_version, &value.book_hash, book_hash)?;
+        Ok(VersionedRemote {
+            value: Some(value),
+            version: Some(object.version),
+        })
     }
 
     async fn write_remote_bookmarks(&self, meta: &BookReadingMeta) -> Result<()> {
@@ -1148,33 +1347,103 @@ impl KmoSyncFacade {
             .await
     }
 
-    async fn read_remote_bookmarks(&self, book_hash: &str) -> Result<Option<RemoteBookmarks>> {
+    async fn read_remote_bookmarks(
+        &self,
+        book_hash: &str,
+    ) -> Result<VersionedRemote<RemoteBookmarks>> {
         let path = self.remote_bookmarks_path(book_hash);
-        let Some(encrypted) = self.storage.read_object_optional(&path).await? else {
-            return Ok(None);
+        let Some(object) = self.storage.read_object_versioned(&path).await? else {
+            return Ok(VersionedRemote {
+                value: None,
+                version: None,
+            });
         };
-        let bytes = self.crypto().decrypt(&encrypted)?;
-        Ok(Some(serde_json::from_slice(&bytes)?))
+        let bytes = self.crypto().decrypt(&object.data)?;
+        let value: RemoteBookmarks = serde_json::from_slice(&bytes)?;
+        validate_remote_object(value.schema_version, &value.book_hash, book_hash)?;
+        Ok(VersionedRemote {
+            value: Some(value),
+            version: Some(object.version),
+        })
     }
 
-    async fn read_remote_tombstones(&self, book_hash: &str) -> Result<Option<TombstoneSet>> {
+    async fn read_remote_tombstones(
+        &self,
+        book_hash: &str,
+    ) -> Result<VersionedRemote<TombstoneSet>> {
         let path = self.remote_tombstones_path(book_hash);
-        let Some(encrypted) = self.storage.read_object_optional(&path).await? else {
-            return Ok(None);
+        let Some(object) = self.storage.read_object_versioned(&path).await? else {
+            return Ok(VersionedRemote {
+                value: None,
+                version: None,
+            });
         };
-        let bytes = self.crypto().decrypt(&encrypted)?;
-        Ok(Some(TombstoneSet::decode(&bytes)?))
+        let bytes = self.crypto().decrypt(&object.data)?;
+        Ok(VersionedRemote {
+            value: Some(TombstoneSet::decode(&bytes)?),
+            version: Some(object.version),
+        })
     }
 
-    async fn write_remote_tombstones(
+    async fn write_remote_progress_conditional(
+        &self,
+        meta: &BookReadingMeta,
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        let payload = RemoteProgress {
+            schema_version: REMOTE_PROTOCOL_VERSION,
+            book_hash: meta.book_hash.clone(),
+            progress: meta.progress.clone(),
+            last_writer_device_id: meta.device_id.clone(),
+            last_write_ts: meta.wall_clock_ts,
+        };
+        let encrypted = self.crypto().encrypt(&serde_json::to_vec(&payload)?)?;
+        self.storage
+            .write_object_conditional(
+                &self.remote_progress_path(&meta.book_hash),
+                &encrypted,
+                expected,
+            )
+            .await
+    }
+
+    async fn write_remote_bookmarks_conditional(
+        &self,
+        meta: &BookReadingMeta,
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        let payload = RemoteBookmarks {
+            schema_version: REMOTE_PROTOCOL_VERSION,
+            book_hash: meta.book_hash.clone(),
+            bookmarks: meta.bookmarks.clone(),
+            highlights: meta.highlights.clone(),
+            notes: meta.notes.clone(),
+            last_writer_device_id: meta.device_id.clone(),
+            last_write_ts: meta.wall_clock_ts,
+        };
+        let encrypted = self.crypto().encrypt(&serde_json::to_vec(&payload)?)?;
+        self.storage
+            .write_object_conditional(
+                &self.remote_bookmarks_path(&meta.book_hash),
+                &encrypted,
+                expected,
+            )
+            .await
+    }
+
+    async fn write_remote_tombstones_conditional(
         &self,
         book_hash: &str,
         set: &TombstoneSet,
-    ) -> Result<()> {
-        let bytes = set.encode()?;
-        let encrypted = self.crypto().encrypt(&bytes)?;
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        let encrypted = self.crypto().encrypt(&set.encode()?)?;
         self.storage
-            .write_object(&self.remote_tombstones_path(book_hash), &encrypted)
+            .write_object_conditional(
+                &self.remote_tombstones_path(book_hash),
+                &encrypted,
+                expected,
+            )
             .await
     }
 
@@ -1183,6 +1452,7 @@ impl KmoSyncFacade {
     }
 
     async fn sync_book_inner(&self, book_hash: &str, mode: SyncMode) -> Result<()> {
+        self.refresh_active_remote_namespace().await?;
         let remote_path = self.remote_book_path(book_hash);
         let local_path = self.local_book_path(book_hash);
         let indexed_path = self.indexed_local_book_path(book_hash)?;
@@ -1195,8 +1465,8 @@ impl KmoSyncFacade {
                     "local book hash mismatch: expected {book_hash}, got {actual_hash}"
                 )));
             }
-            let local_bytes = std::fs::read(source_path)?;
-            if let Some((last_remote_size, last_remote_etag, _)) =
+            let local_size = std::fs::metadata(source_path)?.len();
+            if let Some((last_remote_size, last_remote_etag, last_remote_mtime)) =
                 self.indexed_blob_remote_info(book_hash)?
             {
                 match self.storage.stat(&remote_path).await {
@@ -1205,6 +1475,7 @@ impl KmoSyncFacade {
                             &stat,
                             last_remote_size,
                             last_remote_etag.as_deref(),
+                            last_remote_mtime,
                         ) =>
                     {
                         if source_path != local_path {
@@ -1224,8 +1495,7 @@ impl KmoSyncFacade {
                     }
                     Ok(_) => {}
                     Err(err) if is_remote_not_found_error(&err) => {
-                        let encrypted = self.crypto().encrypt(&local_bytes)?;
-                        self.storage.write_object(&remote_path, &encrypted).await?;
+                        self.upload_book_file(source_path, &remote_path).await?;
                         if source_path != local_path {
                             if let Some(parent) = local_path.parent() {
                                 std::fs::create_dir_all(parent)?;
@@ -1246,22 +1516,21 @@ impl KmoSyncFacade {
                 }
             }
             if self.storage.exists(&remote_path).await? {
-                let remote_encrypted = self.storage.read_object(&remote_path).await?;
-                let remote_bytes = self.crypto().decrypt(&remote_encrypted)?;
-                let remote_hash = blake3::hash(&remote_bytes).to_hex().to_string();
+                let (remote_hash, remote_size) = self
+                    .download_book_file(&remote_path, None, book_hash)
+                    .await?;
                 if remote_hash != book_hash {
                     self.record_blob_conflict(
                         book_hash,
                         Some(source_path),
-                        local_bytes.len() as u64,
+                        local_size,
                         &remote_hash,
-                        remote_bytes.len() as u64,
+                        remote_size,
                     )?;
                     return Ok(());
                 }
             } else {
-                let encrypted = self.crypto().encrypt(&local_bytes)?;
-                self.storage.write_object(&remote_path, &encrypted).await?;
+                self.upload_book_file(source_path, &remote_path).await?;
             }
             if source_path != local_path {
                 if let Some(parent) = local_path.parent() {
@@ -1281,17 +1550,13 @@ impl KmoSyncFacade {
         }
 
         if mode != SyncMode::PushOnly && self.storage.exists(&remote_path).await? {
-            let encrypted = self.storage.read_object(&remote_path).await?;
-            let bytes = self.crypto().decrypt(&encrypted)?;
-            let actual_hash = blake3::hash(&bytes).to_hex().to_string();
+            let (actual_hash, size) = self
+                .download_book_file(&remote_path, Some(&local_path), book_hash)
+                .await?;
             if actual_hash != book_hash {
-                self.record_blob_conflict(book_hash, None, 0, &actual_hash, bytes.len() as u64)?;
+                self.record_blob_conflict(book_hash, None, 0, &actual_hash, size)?;
                 return Ok(());
             }
-            if let Some(parent) = local_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&local_path, bytes)?;
             let stat = self.storage.stat(&remote_path).await?;
             self.upsert_blob_index(
                 book_hash,
@@ -1306,6 +1571,63 @@ impl KmoSyncFacade {
         Err(SyncError::Storage(format!(
             "book {book_hash} is not present locally or remotely"
         )))
+    }
+
+    async fn upload_book_file(&self, source: &Path, remote_path: &str) -> Result<()> {
+        let encrypted_path = self.transfer_path("upload");
+        if let Some(parent) = encrypted_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.crypto().encrypt_file(source, &encrypted_path)?;
+        let size = std::fs::metadata(&encrypted_path)?.len();
+        let file = tokio::fs::File::open(&encrypted_path).await?;
+        let result = self
+            .storage
+            .upload_large(remote_path, Box::new(file), size)
+            .await;
+        let _ = tokio::fs::remove_file(encrypted_path).await;
+        result
+    }
+
+    async fn download_book_file(
+        &self,
+        remote_path: &str,
+        destination: Option<&Path>,
+        expected_hash: &str,
+    ) -> Result<(String, u64)> {
+        let encrypted_path = self.transfer_path("download-encrypted");
+        let plaintext_path = self.transfer_path("download-plain");
+        if let Some(parent) = encrypted_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut remote = self.storage.download_large(remote_path).await?;
+        let mut encrypted = tokio::fs::File::create(&encrypted_path).await?;
+        tokio::io::copy(&mut remote, &mut encrypted).await?;
+        drop(encrypted);
+        let decrypt_result = self.crypto().decrypt_file(&encrypted_path, &plaintext_path);
+        let _ = std::fs::remove_file(&encrypted_path);
+        decrypt_result?;
+        let size = std::fs::metadata(&plaintext_path)?.len();
+        let hash = blake3_file_hex(&plaintext_path)?;
+        if let Some(destination) = destination.filter(|_| hash == expected_hash) {
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&plaintext_path, destination)?;
+        } else {
+            let _ = std::fs::remove_file(&plaintext_path);
+        }
+        Ok((hash, size))
+    }
+
+    fn transfer_path(&self, label: &str) -> PathBuf {
+        static NEXT_TRANSFER_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_TRANSFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.config
+            .local_cache_dir
+            .join("transfers")
+            .join(format!("{label}-{}-{id}.tmp", std::process::id()))
     }
 
     async fn discover_meta_pairs(&self, mode: SyncMode) -> Result<Vec<(String, String)>> {
@@ -1337,8 +1659,15 @@ impl KmoSyncFacade {
         if mode != SyncMode::PushOnly {
             let mut seen = std::collections::BTreeSet::new();
             for prefix in ["book_progress", "bookmarks"] {
-                for info in self.storage.list_prefix(prefix).await? {
-                    let rest = match info.path.strip_prefix(&format!("{prefix}/")) {
+                for info in self
+                    .storage
+                    .list_prefix(&self.active_remote_path(prefix))
+                    .await?
+                {
+                    let Some(logical_path) = self.strip_active_remote_path(&info.path) else {
+                        continue;
+                    };
+                    let rest = match logical_path.strip_prefix(&format!("{prefix}/")) {
                         Some(rest) => rest,
                         None => continue,
                     };
@@ -1350,8 +1679,15 @@ impl KmoSyncFacade {
                 }
             }
             for prefix in ["books"] {
-                for info in self.storage.list_prefix(prefix).await? {
-                    let rest = match info.path.strip_prefix(&format!("{prefix}/")) {
+                for info in self
+                    .storage
+                    .list_prefix(&self.active_remote_path(prefix))
+                    .await?
+                {
+                    let Some(logical_path) = self.strip_active_remote_path(&info.path) else {
+                        continue;
+                    };
+                    let rest = match logical_path.strip_prefix(&format!("{prefix}/")) {
                         Some(rest) => rest,
                         None => continue,
                     };
@@ -1383,8 +1719,15 @@ impl KmoSyncFacade {
             }
         }
         if mode != SyncMode::PushOnly {
-            for info in self.storage.list_prefix("books").await? {
-                let full = &info.path;
+            for info in self
+                .storage
+                .list_prefix(&self.active_remote_path("books"))
+                .await?
+            {
+                let Some(logical_path) = self.strip_active_remote_path(&info.path) else {
+                    continue;
+                };
+                let full = &logical_path;
                 let Some(rest) = full.strip_prefix("books/") else {
                     continue;
                 };
@@ -1839,9 +2182,9 @@ fn merge_meta_with_remote(
             base.bookmarks = rb.bookmarks.clone();
             base.highlights = rb.highlights.clone();
             base.notes = rb.notes.clone();
-            merge_bookmark_list(&mut base.bookmarks, &local_bookmarks);
-            merge_highlight_list(&mut base.highlights, &local_highlights);
-            merge_note_list(&mut base.notes, &local_notes);
+            append_missing_bookmarks(&mut base.bookmarks, &local_bookmarks);
+            append_missing_highlights(&mut base.highlights, &local_highlights);
+            append_missing_notes(&mut base.notes, &local_notes);
             base.wall_clock_ts = rb.last_write_ts;
             base.device_id = rb.last_writer_device_id.clone();
         } else if rb_same_writer {
@@ -1869,6 +2212,17 @@ fn merge_bookmark_list(target: &mut Vec<Bookmark>, incoming: &[Bookmark]) {
     }
 }
 
+fn append_missing_bookmarks(target: &mut Vec<Bookmark>, incoming: &[Bookmark]) {
+    for item in incoming {
+        if !target
+            .iter()
+            .any(|existing| existing.bookmark_id == item.bookmark_id)
+        {
+            target.push(item.clone());
+        }
+    }
+}
+
 fn merge_highlight_list(target: &mut Vec<Highlight>, incoming: &[Highlight]) {
     for item in incoming {
         if let Some(existing) = target
@@ -1884,6 +2238,17 @@ fn merge_highlight_list(target: &mut Vec<Highlight>, incoming: &[Highlight]) {
     }
 }
 
+fn append_missing_highlights(target: &mut Vec<Highlight>, incoming: &[Highlight]) {
+    for item in incoming {
+        if !target
+            .iter()
+            .any(|existing| existing.highlight_id == item.highlight_id)
+        {
+            target.push(item.clone());
+        }
+    }
+}
+
 fn merge_note_list(target: &mut Vec<BookNote>, incoming: &[BookNote]) {
     for item in incoming {
         if let Some(existing) = target.iter_mut().find(|e| e.note_id == item.note_id) {
@@ -1891,6 +2256,17 @@ fn merge_note_list(target: &mut Vec<BookNote>, incoming: &[BookNote]) {
                 *existing = item.clone();
             }
         } else {
+            target.push(item.clone());
+        }
+    }
+}
+
+fn append_missing_notes(target: &mut Vec<BookNote>, incoming: &[BookNote]) {
+    for item in incoming {
+        if !target
+            .iter()
+            .any(|existing| existing.note_id == item.note_id)
+        {
             target.push(item.clone());
         }
     }
@@ -2067,7 +2443,7 @@ fn build_storage(
                 root_prefix: storage_config
                     .root_prefix
                     .clone()
-                    .unwrap_or_else(|| "kmo_sync".to_string()),
+                    .unwrap_or_else(|| "kmo-sync".to_string()),
                 path_style: storage_config.path_style.unwrap_or(true),
                 allow_http: storage_config.allow_http.unwrap_or(false),
             };
@@ -2082,7 +2458,7 @@ fn build_storage(
                     .root_dir
                     .as_ref()
                     .map(|path| path.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "kmo_sync".to_string()),
+                    .unwrap_or_else(|| "kmo-sync".to_string()),
             };
             Ok(Arc::new(WebDavStorage::new(config)?))
         }
@@ -2142,6 +2518,61 @@ fn remove_meta_item(meta: &mut BookReadingMeta, item_type: &TombstoneItemType, i
             .retain(|item| item.highlight_id != item_uuid),
         TombstoneItemType::Note => meta.notes.retain(|item| item.note_id != item_uuid),
     }
+}
+
+fn snapshot_meta_item(
+    meta: &BookReadingMeta,
+    item_type: &TombstoneItemType,
+    item_uuid: &str,
+) -> Result<String> {
+    match item_type {
+        TombstoneItemType::Bookmark => meta
+            .bookmarks
+            .iter()
+            .find(|item| item.bookmark_id == item_uuid)
+            .map(serde_json::to_string),
+        TombstoneItemType::Highlight => meta
+            .highlights
+            .iter()
+            .find(|item| item.highlight_id == item_uuid)
+            .map(serde_json::to_string),
+        TombstoneItemType::Note => meta
+            .notes
+            .iter()
+            .find(|item| item.note_id == item_uuid)
+            .map(serde_json::to_string),
+    }
+    .ok_or_else(|| SyncError::InvalidArg(format!("metadata item not found: {item_uuid}")))?
+    .map_err(Into::into)
+}
+
+fn restore_meta_item(meta: &mut BookReadingMeta, tombstone: &Tombstone) -> Result<()> {
+    let snapshot = tombstone.deleted_item_json.as_deref().ok_or_else(|| {
+        SyncError::Conflict(format!(
+            "deletion for {} has no restorable snapshot",
+            tombstone.uuid
+        ))
+    })?;
+    match tombstone.item_type {
+        TombstoneItemType::Bookmark => {
+            let item: Bookmark = serde_json::from_str(snapshot)?;
+            meta.bookmarks
+                .retain(|value| value.bookmark_id != item.bookmark_id);
+            meta.bookmarks.push(item);
+        }
+        TombstoneItemType::Highlight => {
+            let item: Highlight = serde_json::from_str(snapshot)?;
+            meta.highlights
+                .retain(|value| value.highlight_id != item.highlight_id);
+            meta.highlights.push(item);
+        }
+        TombstoneItemType::Note => {
+            let item: BookNote = serde_json::from_str(snapshot)?;
+            meta.notes.retain(|value| value.note_id != item.note_id);
+            meta.notes.push(item);
+        }
+    }
+    Ok(())
 }
 
 fn conflict_state_json(
@@ -2275,13 +2706,14 @@ fn remote_stat_matches_index(
     stat: &crate::storage::RemoteFileInfo,
     last_remote_size: i64,
     last_remote_etag: Option<&str>,
+    last_remote_mtime: i64,
 ) -> bool {
     if stat.size as i64 != last_remote_size {
         return false;
     }
     match last_remote_etag {
         Some(etag) => stat.etag.as_deref() == Some(etag),
-        None => true,
+        None => stat.mtime != 0 && stat.mtime == last_remote_mtime,
     }
 }
 
@@ -2301,6 +2733,40 @@ fn validate_json<T: for<'de> Deserialize<'de>>(json: &str, name: &str) -> Result
         return Err(SyncError::InvalidArg(format!("{name} is empty")));
     }
     Ok(serde_json::from_str(json)?)
+}
+
+fn validate_identifier(value: &str, name: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(SyncError::InvalidArg(format!("{name} is empty")));
+    }
+    if value.len() > 255
+        || value == "."
+        || value == ".."
+        || value.contains('/')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err(SyncError::InvalidArg(format!("unsafe {name}: {value:?}")));
+    }
+    Ok(())
+}
+
+fn validate_remote_object(
+    schema_version: u32,
+    actual_book_hash: &str,
+    book_hash: &str,
+) -> Result<()> {
+    if schema_version != REMOTE_PROTOCOL_VERSION {
+        return Err(SyncError::VersionMismatch(format!(
+            "remote metadata schema {schema_version} is incompatible with {REMOTE_PROTOCOL_VERSION}"
+        )));
+    }
+    if actual_book_hash != book_hash {
+        return Err(SyncError::Conflict(format!(
+            "remote metadata book hash mismatch: expected {book_hash}, got {actual_book_hash}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2459,7 +2925,7 @@ mod tests {
     }
 
     #[test]
-    fn reeden_layout_no_protocol_version_check_is_performed() {
+    fn legacy_sync_header_is_ignored_by_the_flat_layout() {
         // Old protocol headers from previous versions should be silently ignored
         // because the new layout doesn't carry one at all.
         let remote = tempfile::tempdir().unwrap();
@@ -2701,10 +3167,19 @@ mod tests {
         let remote_path = remote.path().join("book_progress/book-1.json.env");
         let before = std::fs::read(&remote_path).unwrap();
         let rewrapped = facade_a.rotate_envelope_kek(new_encryption).unwrap();
-        let after = std::fs::read(&remote_path).unwrap();
+        let marker: ActiveRemoteNamespace = serde_json::from_slice(
+            &std::fs::read(remote.path().join("_active_namespace.json")).unwrap(),
+        )
+        .unwrap();
+        let rotated_path = remote
+            .path()
+            .join(marker.namespace)
+            .join("book_progress/book-1.json.env");
+        let after = std::fs::read(rotated_path).unwrap();
 
         assert_eq!(rewrapped, 1);
         assert_ne!(before, after);
+        assert_eq!(std::fs::read(&remote_path).unwrap(), before);
 
         let old_reader = facade_for_with_encryption(
             cache_old.path(),
@@ -3311,7 +3786,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_meta_conflict_is_a_noop_under_last_write_wins() {
+    fn choosing_remote_conflict_version_pulls_without_overwriting_remote() {
         let remote = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let facade = facade_for(cache.path(), remote.path(), "device-a");
@@ -3340,9 +3815,8 @@ mod tests {
         )
         .unwrap();
 
-        facade.sync_single_meta("book-1", "resolve-meta").unwrap();
-
-        // LWW resolves automatically — no conflict is recorded.
+        // No explicit conflict row exists, so the manual override must perform
+        // a pull-only refresh instead of writing the stale local snapshot.
         assert_eq!(facade.conflict_count().unwrap(), 0);
         // resolve_meta_conflict still works as a manual override for power users.
         facade
@@ -3438,20 +3912,14 @@ mod tests {
             create_ts: 1,
         });
         facade_a.put_local_meta(&meta).unwrap();
-        facade_a
-            .sync_single_meta("book-1", "revival-meta")
-            .unwrap();
-        facade_b
-            .sync_single_meta("book-1", "revival-meta")
-            .unwrap();
+        facade_a.sync_single_meta("book-1", "revival-meta").unwrap();
+        facade_b.sync_single_meta("book-1", "revival-meta").unwrap();
 
         // A 删除 highlight-1 并同步（tombstone 传播到远端，远端 bookmarks 清空）
         facade_a
             .mark_meta_item_deleted("revival-meta", "highlight", "highlight-1")
             .unwrap();
-        facade_a
-            .sync_single_meta("book-1", "revival-meta")
-            .unwrap();
+        facade_a.sync_single_meta("book-1", "revival-meta").unwrap();
 
         // A undo → tombstone 被 revive，记录 revival
         facade_a
@@ -3464,16 +3932,12 @@ mod tests {
         assert_eq!(a_tombstones.revivals.len(), 1);
 
         // A sync → revival 传播到远端（远端 tombstone 获得 revival 记录）
-        facade_a
-            .sync_single_meta("book-1", "revival-meta")
-            .unwrap();
+        facade_a.sync_single_meta("book-1", "revival-meta").unwrap();
 
         // B sync → B 本地缓存有 highlight-1，union 逻辑会救回它
         // 如果没有 revival，tombstone 会过滤掉救回的 highlight-1
         // 有了 revival，tombstone 被撤销，highlight-1 保留
-        facade_b
-            .sync_single_meta("book-1", "revival-meta")
-            .unwrap();
+        facade_b.sync_single_meta("book-1", "revival-meta").unwrap();
         let b_meta = facade_b.read_local_meta("revival-meta").unwrap().unwrap();
         assert_eq!(b_meta.highlights.len(), 1);
         assert_eq!(b_meta.highlights[0].highlight_id, "highlight-1");
@@ -3702,5 +4166,144 @@ mod tests {
             KmoSyncFacade::remote_book_dir(book_hash),
             format!("books/{book_hash}")
         );
+    }
+
+    #[test]
+    fn newer_remote_highlight_content_is_not_replaced_by_stale_local_content() {
+        let mut local = sample_meta("meta-merge", 0.1, 10);
+        local.device_id = "device-a".to_string();
+        local.highlights.push(Highlight {
+            highlight_id: "shared".to_string(),
+            cfi_start: "a".to_string(),
+            cfi_end: "b".to_string(),
+            color: "yellow".to_string(),
+            comment: "stale".to_string(),
+            create_ts: 1,
+        });
+        let remote = RemoteBookmarks {
+            schema_version: REMOTE_PROTOCOL_VERSION,
+            book_hash: "book-1".to_string(),
+            bookmarks: vec![],
+            highlights: vec![Highlight {
+                comment: "new remote comment".to_string(),
+                ..local.highlights[0].clone()
+            }],
+            notes: vec![],
+            last_writer_device_id: "device-b".to_string(),
+            last_write_ts: 20,
+        };
+        let merged = merge_meta_with_remote(Some(local), None, Some(&remote));
+        assert_eq!(merged.highlights[0].comment, "new remote comment");
+    }
+
+    #[test]
+    fn undo_deletion_restores_the_snapshot_on_the_same_device() {
+        let remote = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let facade = facade_for(cache.path(), remote.path(), "device-a");
+        let mut meta = sample_meta("undo-meta", 0.1, 1);
+        meta.highlights.push(Highlight {
+            highlight_id: "highlight-undo".to_string(),
+            cfi_start: "a".to_string(),
+            cfi_end: "b".to_string(),
+            color: "yellow".to_string(),
+            comment: "restore me".to_string(),
+            create_ts: 1,
+        });
+        facade.put_local_meta(&meta).unwrap();
+        facade
+            .mark_meta_item_deleted("undo-meta", "highlight", "highlight-undo")
+            .unwrap();
+        facade.undo_deletion("undo-meta", "highlight-undo").unwrap();
+        let restored = facade.read_local_meta("undo-meta").unwrap().unwrap();
+        assert_eq!(restored.highlights.len(), 1);
+        assert_eq!(restored.highlights[0].comment, "restore me");
+    }
+
+    #[test]
+    fn unsafe_metadata_identifiers_are_rejected() {
+        let remote = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let facade = facade_for(cache.path(), remote.path(), "device-a");
+        let mut meta = sample_meta("../escape", 0.1, 1);
+        assert!(facade.put_local_meta(&meta).is_err());
+        meta.meta_id = "/tmp/escape".to_string();
+        assert!(facade.put_local_meta(&meta).is_err());
+    }
+
+    #[test]
+    fn simultaneous_unique_bookmarks_converge_without_lost_updates() {
+        let remote = tempfile::tempdir().unwrap();
+        let cache_a = tempfile::tempdir().unwrap();
+        let cache_b = tempfile::tempdir().unwrap();
+        let facade_a = std::sync::Arc::new(facade_for(cache_a.path(), remote.path(), "device-a"));
+        let facade_b = std::sync::Arc::new(facade_for(cache_b.path(), remote.path(), "device-b"));
+        let mut meta_a = sample_meta("cas-meta", 0.1, 10);
+        meta_a.device_id = "device-a".to_string();
+        meta_a.bookmarks.push(Bookmark {
+            bookmark_id: "only-a".to_string(),
+            cfi_range: "a".to_string(),
+            title: "a".to_string(),
+            create_ts: 10,
+        });
+        let mut meta_b = sample_meta("cas-meta", 0.1, 10);
+        meta_b.device_id = "device-b".to_string();
+        meta_b.bookmarks.push(Bookmark {
+            bookmark_id: "only-b".to_string(),
+            cfi_range: "b".to_string(),
+            title: "b".to_string(),
+            create_ts: 10,
+        });
+        facade_a.put_local_meta(&meta_a).unwrap();
+        facade_b.put_local_meta(&meta_b).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let thread_a = {
+            let facade = facade_a.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                facade.sync_single_meta("book-1", "cas-meta")
+            })
+        };
+        let thread_b = {
+            let facade = facade_b.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                facade.sync_single_meta("book-1", "cas-meta")
+            })
+        };
+        thread_a.join().unwrap().unwrap();
+        thread_b.join().unwrap().unwrap();
+        facade_a.sync_single_meta("book-1", "cas-meta").unwrap();
+        let merged = facade_a.read_local_meta("cas-meta").unwrap().unwrap();
+        assert!(
+            merged
+                .bookmarks
+                .iter()
+                .any(|item| item.bookmark_id == "only-a")
+        );
+        assert!(
+            merged
+                .bookmarks
+                .iter()
+                .any(|item| item.bookmark_id == "only-b")
+        );
+    }
+
+    #[test]
+    fn incompatible_remote_metadata_schema_is_rejected() {
+        let remote = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let facade = facade_for(cache.path(), remote.path(), "device-a");
+        std::fs::create_dir_all(remote.path().join("book_progress")).unwrap();
+        std::fs::write(
+            remote.path().join("book_progress/book-1.json"),
+            br#"{"schema_version":999,"book_hash":"book-1","progress":null,"last_writer_device_id":"future","last_write_ts":1}"#,
+        )
+        .unwrap();
+        let error = facade
+            .sync_single_meta("book-1", "schema-meta")
+            .unwrap_err();
+        assert_eq!(error.code(), 11);
     }
 }

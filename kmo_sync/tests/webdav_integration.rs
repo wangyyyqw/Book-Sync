@@ -24,12 +24,29 @@ async fn webdav_storage_contract_basic_object_flow() {
         .unwrap();
     assert!(storage.exists("metas/a.meta").await.unwrap());
     assert_eq!(storage.read_object("metas/a.meta").await.unwrap(), b"hello");
+    let stale = storage
+        .read_object_versioned("metas/a.meta")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        storage
+            .write_object_conditional("metas/a.meta", b"new", Some(&stale.version))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !storage
+            .write_object_conditional("metas/a.meta", b"lost", Some(&stale.version))
+            .await
+            .unwrap()
+    );
 
     let listed = storage.list_prefix("metas").await.unwrap();
     assert!(listed.iter().any(|item| item.path == "metas/a.meta"));
 
     let stat = storage.stat("metas/a.meta").await.unwrap();
-    assert_eq!(stat.size, 5);
+    assert_eq!(stat.size, 3);
 
     storage.remove("metas/a.meta").await.unwrap();
     assert!(!storage.exists("metas/a.meta").await.unwrap());

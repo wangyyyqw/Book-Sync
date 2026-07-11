@@ -1,0 +1,3 @@
+headers = kmo_sync.h
+package = com.kmosync.native
+language = C

@@ -1,5 +1,6 @@
 use super::CryptoProvider;
 use crate::Result;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 pub struct NoopCrypto;
@@ -11,6 +12,16 @@ impl CryptoProvider for NoopCrypto {
 
     fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         Ok(ciphertext.to_vec())
+    }
+
+    fn encrypt_file(&self, input: &Path, output: &Path) -> Result<()> {
+        std::fs::copy(input, output)?;
+        Ok(())
+    }
+
+    fn decrypt_file(&self, input: &Path, output: &Path) -> Result<()> {
+        std::fs::copy(input, output)?;
+        Ok(())
     }
 
     fn is_encrypted(&self) -> bool {

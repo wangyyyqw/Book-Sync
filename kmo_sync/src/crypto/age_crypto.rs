@@ -1,7 +1,8 @@
 use super::CryptoProvider;
 use crate::{Result, SyncError};
 use age::x25519::Identity;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use std::str::FromStr;
 
 #[derive(Clone)]
@@ -47,6 +48,36 @@ impl CryptoProvider for AgeCrypto {
         let mut plaintext = Vec::new();
         reader.read_to_end(&mut plaintext)?;
         Ok(plaintext)
+    }
+
+    fn encrypt_file(&self, input: &Path, output: &Path) -> Result<()> {
+        let recipient = self.identity.to_public();
+        let encryptor = age::Encryptor::with_recipients(std::iter::once(&recipient as _))
+            .map_err(|err| SyncError::Crypto(err.to_string()))?;
+        let output = BufWriter::new(std::fs::File::create(output)?);
+        let mut writer = encryptor
+            .wrap_output(output)
+            .map_err(|err| SyncError::Crypto(err.to_string()))?;
+        std::io::copy(
+            &mut BufReader::new(std::fs::File::open(input)?),
+            &mut writer,
+        )?;
+        writer
+            .finish()
+            .map_err(|err| SyncError::Crypto(err.to_string()))?;
+        Ok(())
+    }
+
+    fn decrypt_file(&self, input: &Path, output: &Path) -> Result<()> {
+        let decryptor = age::Decryptor::new(BufReader::new(std::fs::File::open(input)?))
+            .map_err(|err| SyncError::Crypto(err.to_string()))?;
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&self.identity as _))
+            .map_err(|err| SyncError::Crypto(err.to_string()))?;
+        let mut output = BufWriter::new(std::fs::File::create(output)?);
+        std::io::copy(&mut reader, &mut output)?;
+        output.flush()?;
+        Ok(())
     }
 
     fn is_encrypted(&self) -> bool {

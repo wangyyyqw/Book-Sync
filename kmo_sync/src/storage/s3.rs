@@ -1,12 +1,11 @@
-use super::{RemoteFileInfo, RemoteStorage};
+use super::{RemoteFileInfo, RemoteStorage, RemoteVersion, VersionedObject};
 use crate::{Result, SyncError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path as ObjectPath;
-use object_store::{ObjectStore, PutPayload};
-use std::io::Cursor;
+use object_store::{ObjectStore, PutMode, PutPayload, UpdateVersion};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug, Clone)]
@@ -37,6 +36,7 @@ impl S3Storage {
             .with_region(config.region)
             .with_allow_http(config.allow_http)
             .with_virtual_hosted_style_request(!config.path_style)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
             .build()
             .map_err(map_object_store_error)?;
 
@@ -113,6 +113,26 @@ impl RemoteStorage for S3Storage {
         .await
     }
 
+    async fn read_object_versioned(&self, remote_path: &str) -> Result<Option<VersionedObject>> {
+        let p = self.full_path(remote_path)?;
+        match self.inner.get(&p).await {
+            Ok(result) => {
+                let version = RemoteVersion {
+                    etag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let data = result
+                    .bytes()
+                    .await
+                    .map_err(map_object_store_error)?
+                    .to_vec();
+                Ok(Some(VersionedObject { data, version }))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(map_object_store_error(err)),
+        }
+    }
+
     async fn write_object(&self, remote_path: &str, data: &[u8]) -> Result<()> {
         let p = self.full_path(remote_path)?;
         let payload = PutPayload::from(data.to_vec());
@@ -121,6 +141,33 @@ impl RemoteStorage for S3Storage {
         })
         .await?;
         Ok(())
+    }
+
+    async fn write_object_conditional(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        let p = self.full_path(remote_path)?;
+        let mode = match expected {
+            None => PutMode::Create,
+            Some(version) => PutMode::Update(UpdateVersion {
+                e_tag: version.etag.clone(),
+                version: version.version.clone(),
+            }),
+        };
+        match self
+            .inner
+            .put_opts(&p, PutPayload::from(data.to_vec()), mode.into())
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::NotModified { .. }) => Ok(false),
+            Err(err) => Err(map_object_store_error(err)),
+        }
     }
 
     async fn remove(&self, remote_path: &str) -> Result<()> {
@@ -192,8 +239,13 @@ impl RemoteStorage for S3Storage {
     }
 
     async fn download_large(&self, remote_path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>> {
-        let bytes = self.read_object(remote_path).await?;
-        Ok(Box::new(Cursor::new(bytes)))
+        let result = self
+            .inner
+            .get(&self.full_path(remote_path)?)
+            .await
+            .map_err(map_object_store_error)?;
+        let stream = result.into_stream().map_err(std::io::Error::other);
+        Ok(Box::new(tokio_util::io::StreamReader::new(stream)))
     }
 }
 

@@ -21,7 +21,7 @@
 //! fully offline and deterministic. Cleaning the test only requires
 //! removing the tempdir; the bucket is untouched.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kmo_sync::event::EventEmitter;
 use kmo_sync::model::{BookNote, BookReadingMeta, Bookmark, Highlight, MetaEdit, ReadingProgress};
@@ -34,33 +34,33 @@ struct ScenarioBook {
     label: &'static str,
     /// Source EPUB path. Small files live in `测试文件/`; the 164 MiB phone
     /// edition lives at the repo root.
-    source_path: &'static str,
+    source_path: PathBuf,
     /// Logical meta_id used across all phases. Derived from the source
     /// file hash under the reeden layout (book_hash == meta_id).
     meta_id: String,
 }
 
-fn books() -> [ScenarioBook; 3] {
+fn books(root: &Path) -> Vec<ScenarioBook> {
     [
-        ScenarioBook {
-            label: "kasaike",
-            source_path: "/Users/aaa/Documents/github/KMO-Sync/测试文件/恐妻家 - [日]伊坂幸太郎.epub",
-            meta_id: blake3_hex_of_file("/Users/aaa/Documents/github/KMO-Sync/测试文件/恐妻家 - [日]伊坂幸太郎.epub").unwrap_or_else(|| "meta-kasaike".to_string()),
-        },
-        ScenarioBook {
-            label: "yuewei",
-            source_path: "/Users/aaa/Documents/github/KMO-Sync/测试文件/阅微草堂笔记.epub",
-            meta_id: blake3_hex_of_file("/Users/aaa/Documents/github/KMO-Sync/测试文件/阅微草堂笔记.epub").unwrap_or_else(|| "meta-yuewei".to_string()),
-        },
-        ScenarioBook {
-            label: "haidi",
-            // Use a second copy of the same source for legacy fixture
-            // compatibility (the original "海底两万里-phone.epub" fixture is
-            // not always present in CI).
-            source_path: "/Users/aaa/Documents/github/KMO-Sync/测试文件/C41-愤怒的葡萄-[美] 约翰·斯坦贝克-手机.epub",
-            meta_id: blake3_hex_of_file("/Users/aaa/Documents/github/KMO-Sync/测试文件/C41-愤怒的葡萄-[美] 约翰·斯坦贝克-手机.epub").unwrap_or_else(|| "meta-haidi".to_string()),
-        },
+        ("kasaike", 400 * 1024),
+        ("yuewei", 9 * 1024 * 1024),
+        ("haidi", 18 * 1024 * 1024),
     ]
+    .into_iter()
+    .enumerate()
+    .map(|(seed, (label, size))| {
+        let source_path = root.join(format!("{label}.epub"));
+        let bytes: Vec<u8> = (0..size)
+            .map(|index| ((index + seed * 17) % 251) as u8)
+            .collect();
+        std::fs::write(&source_path, bytes).unwrap();
+        ScenarioBook {
+            label,
+            meta_id: blake3_hex_of_file(&source_path).unwrap(),
+            source_path,
+        }
+    })
+    .collect()
 }
 
 #[test]
@@ -69,6 +69,8 @@ fn simulate_three_books_phone_pad_phone_roundtrip() {
     let cache_phone = tempfile::tempdir().expect("tempdir for phone");
     let cache_pad = tempfile::tempdir().expect("tempdir for pad");
     let cache_phone_again = tempfile::tempdir().expect("tempdir for phone (again)");
+    let fixtures = tempfile::tempdir().expect("tempdir for generated EPUB fixtures");
+    let books = books(fixtures.path());
 
     // Each device uses a different envelope passphrase-equivalent: for this
     // offline simulation we run with `none` encryption so the layout under
@@ -94,8 +96,8 @@ fn simulate_three_books_phone_pad_phone_roundtrip() {
         &encryption_json,
     );
 
-    for book in books() {
-        run_book_scenario(&book, &phone, &pad, &phone_again, remote.path());
+    for book in &books {
+        run_book_scenario(book, &phone, &pad, &phone_again, remote.path());
     }
 
     // Final inspection of the bucket layout so a regression in
@@ -106,8 +108,11 @@ fn simulate_three_books_phone_pad_phone_roundtrip() {
         "expected books/ tree under {}",
         remote.path().display()
     );
-    let expected_hashes: Vec<&str> = books().iter().map(|b| b.source_path).collect();
-    for path in &expected_hashes {
+    let expected_paths: Vec<&Path> = books
+        .iter()
+        .map(|book| book.source_path.as_path())
+        .collect();
+    for path in expected_paths {
         let hash = blake3_hex_of_file(path).unwrap();
         let book_blob = books_root.join(&hash);
         assert!(
@@ -144,16 +149,17 @@ fn open_device(
     .expect("create facade")
 }
 
-fn blake3_hex_of_file(path: &str) -> Option<String> {
+fn blake3_hex_of_file(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
 fn book_bytes_or_panic(book: &ScenarioBook) -> Vec<u8> {
-    std::fs::read(book.source_path).unwrap_or_else(|err| {
+    std::fs::read(&book.source_path).unwrap_or_else(|err| {
         panic!(
             "missing test fixture {} for {}: {err}; place the EPUB at the expected path",
-            book.source_path, book.label
+            book.source_path.display(),
+            book.label
         )
     })
 }

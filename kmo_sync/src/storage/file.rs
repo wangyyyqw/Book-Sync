@@ -1,4 +1,4 @@
-use super::{RemoteFileInfo, RemoteStorage};
+use super::{RemoteFileInfo, RemoteStorage, RemoteVersion, VersionedObject};
 use crate::{Result, SyncError};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -46,6 +46,49 @@ impl FileStorage {
             etag: None,
         })
     }
+
+    fn version(data: &[u8]) -> RemoteVersion {
+        RemoteVersion {
+            etag: Some(blake3::hash(data).to_hex().to_string()),
+            version: None,
+        }
+    }
+
+    async fn acquire_lock(path: &Path) -> Result<fs::File> {
+        let lock_path = path.with_extension(format!(
+            "{}.kmo-cas-lock",
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+        ));
+        for _ in 0..500 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .await
+            {
+                Ok(file) => return Ok(file),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&lock_path)
+                        .await
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > std::time::Duration::from_secs(30));
+                    if stale {
+                        let _ = fs::remove_file(&lock_path).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Err(SyncError::Storage(format!(
+            "timed out acquiring CAS lock for {}",
+            path.display()
+        )))
+    }
 }
 
 #[async_trait]
@@ -68,11 +111,66 @@ impl RemoteStorage for FileStorage {
         }
     }
 
+    async fn read_object_versioned(&self, remote_path: &str) -> Result<Option<VersionedObject>> {
+        let Some(data) = self.read_object_optional(remote_path).await? else {
+            return Ok(None);
+        };
+        Ok(Some(VersionedObject {
+            version: Self::version(&data),
+            data,
+        }))
+    }
+
     async fn write_object(&self, remote_path: &str, data: &[u8]) -> Result<()> {
         let path = self.full_path(remote_path)?;
         Self::ensure_parent(&path).await?;
         fs::write(path, data).await?;
         Ok(())
+    }
+
+    async fn write_object_conditional(
+        &self,
+        remote_path: &str,
+        data: &[u8],
+        expected: Option<&RemoteVersion>,
+    ) -> Result<bool> {
+        let path = self.full_path(remote_path)?;
+        Self::ensure_parent(&path).await?;
+        let lock_path = path.with_extension(format!(
+            "{}.kmo-cas-lock",
+            path.extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("")
+        ));
+        let lock = Self::acquire_lock(&path).await?;
+        let current = match fs::read(&path).await {
+            Ok(bytes) => Some(Self::version(&bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                drop(lock);
+                let _ = fs::remove_file(&lock_path).await;
+                return Err(err.into());
+            }
+        };
+        let matches = match (expected, current.as_ref()) {
+            (None, None) => true,
+            (Some(expected), Some(current)) => expected == current,
+            _ => false,
+        };
+        if matches {
+            let temp_path = path.with_extension(format!(
+                "{}.{}.tmp",
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(""),
+                std::process::id()
+            ));
+            fs::write(&temp_path, data).await?;
+            fs::rename(&temp_path, &path).await?;
+        }
+        drop(lock);
+        fs::remove_file(lock_path).await?;
+        Ok(matches)
     }
 
     async fn remove(&self, remote_path: &str) -> Result<()> {
@@ -171,5 +269,38 @@ mod tests {
 
         storage.remove("metas/a.meta").await.unwrap();
         assert!(!storage.exists("metas/a.meta").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn conditional_write_rejects_a_stale_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path().to_path_buf());
+        assert!(
+            storage
+                .write_object_conditional("bookmarks/a.json", b"one", None)
+                .await
+                .unwrap()
+        );
+        let stale = storage
+            .read_object_versioned("bookmarks/a.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            storage
+                .write_object_conditional("bookmarks/a.json", b"two", Some(&stale.version))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .write_object_conditional("bookmarks/a.json", b"lost", Some(&stale.version))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            storage.read_object("bookmarks/a.json").await.unwrap(),
+            b"two"
+        );
     }
 }

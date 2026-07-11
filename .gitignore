@@ -1,0 +1,4 @@
+.gradle/
+local.properties
+**/build/
+kmo-sync-kmp/src/androidMain/jniLibs/**/*.so

@@ -8,7 +8,7 @@ Book Sync 是一个面向阅读类应用的跨平台同步 SDK。项目核心由
 
 - 多设备同步阅读元数据。
 - 同步书籍文件，支持大文件。
-- 通过 last-write-wins 自动解决阅读元数据冲突；删除状态走本地 tombstone。
+- 通过带 ETag 条件写和重试的 last-write-wins 合并阅读元数据；删除状态通过远端 tombstone 跨设备传播。
 - 检测书籍文件冲突，避免直接覆盖远端内容。
 - 支持 `age` 加密和 AES-GCM 信封加密。
 - 支持 Envelope KEK 轮换：只重包 EDEK，不重新加密正文数据。
@@ -24,6 +24,7 @@ kmo-sync-kmp/             Kotlin Multiplatform 封装
 samples/kmp-reader-sync/  Android 和 iOS 示例应用
 scripts/                  发布验证和辅助脚本
 kmo_sync/docs/            协议设计文档（REEDEN_REFACTOR 等）
+CHANGELOG.md               版本更新与兼容性说明
 ```
 
 ## 构建与验证
@@ -125,7 +126,7 @@ Book Sync 把所有同步状态写在远端存储的 `kmo-sync/` 前缀下，便
 
 ```text
 kmo-sync/
-  books/<book_hash>                            # 书籍文件，明文 / .enc / .env（整本书一次 PUT）
+  books/<book_hash>                            # 书籍文件，明文 / .enc / .env（流式传输）
   book_progress/<book_hash>.json               # 阅读进度 envelope
   bookmarks/<book_hash>.json                   # 书签 / 划线 / 笔记 envelope
   metadata_backups/<ts>_<device>.zip           # 可选，本地按设备打的 zip 备份
@@ -157,7 +158,9 @@ kmo-sync/
 }
 ```
 
-合并规则：进度走 `last_write_ts` 的 last-write-wins（相等时按 `device_id` 字典序）；书签 / 划线 / 笔记按 item id 去重，单项取 `create_ts` 大者。`metadata_backups` 是可选的本地导出，何时上传到 R2 由调用方决定。
+合并规则：进度走 `last_write_ts` 的 last-write-wins（相等时按 `device_id` 字典序）；书签 / 划线 / 笔记快照也按写入时间确定同 ID 的胜者，同时保留另一侧独有的 ID。`metadata_backups` 是可选的本地导出，何时上传到 R2 由调用方决定。
+
+所有元数据写入都携带读取时获得的 ETag/版本条件；条件失败时会重新读取、合并并重试，避免两个设备同时同步时由最后一次 PUT 静默覆盖另一台设备。WebDAV 服务必须提供 ETag，否则 SDK 会拒绝不安全的并发写入。
 
 本布局对应线缆协议版本 7。低于 7 的旧版本客户端与本布局不兼容，需要升级到最新版本。完整的协议设计说明见 [`kmo_sync/docs/REEDEN_REFACTOR.md`](kmo_sync/docs/REEDEN_REFACTOR.md)。
 
@@ -252,7 +255,7 @@ kmo-sync-kmp/src/androidMain/jniLibs/
 └── x86_64/libkmo_sync.so
 ```
 
-Android 应用依赖 `:kmo-sync-kmp` 后，会自动把这些 `.so` 打进 APK/AAB。
+Android 应用依赖 `:kmo-sync-kmp` 后，会自动把这些 `.so` 打进 APK/AAB。仓库不提交预构建 `.so`；源码依赖和发布流水线必须先运行上述脚本，确保 native 库与当前 Rust 源码一致。
 
 ### 3. JVM 桌面端引用 native 库
 
@@ -291,7 +294,7 @@ cd kmo_sync
 kmo_sync/target/apple/KmoSync.xcframework
 ```
 
-把 `KmoSync.xcframework` 加入 iOS app target，并通过下面的头文件接入 C ABI：
+KMP 模块现在包含 `iosArm64` 和 `iosSimulatorArm64` target，并通过 cinterop 链接对应 Rust staticlib。纯 Swift 项目也可以把 `KmoSync.xcframework` 加入 app target，并通过下面的头文件接入 C ABI：
 
 ```text
 kmo_sync/target/include/kmo_sync.h
@@ -356,9 +359,7 @@ sync.exportMetadataBackup()
 
 `SyncResult.Failure` 会包含 native 错误码和安全错误信息。
 
-> 删除 / 复活 tombstone 现在是**纯本地操作**：调用 `markMetaItemDeleted` /
-> `undoDeletion` 只会更新本地 tombstone 表，不会产生远程 R2 调用。冲突由
-> last-write-wins 在下一次 sync 时自动收敛。
+> `markMetaItemDeleted` 会保存被删除条目的本地快照；`undoDeletion` 因而可以在同一设备恢复内容。tombstone 和 revival 会在下一次 sync 时通过条件写安全地传播到其他设备。
 
 ## 示例应用
 
@@ -443,6 +444,8 @@ cargo test --test r2_dump r2_cleanup_phone_pad_phone_test_prefixes -- --ignored 
 - S3/WebDAV 集成测试默认 ignored，需要提供环境变量或使用 Docker helper 后才会执行。
 - 远端对象布局从协议版本 7 起改为扁平 `kmo-sync/{books,book_progress,bookmarks}/...`，并改用 last-write-wins 合并。低于 7 的旧版本客户端不兼容，请同步升级。
 - 老版本 `yuewei/books/<book_hash>/...` 路径下的数据**不会被自动迁移**；重新执行一次 `syncAll` 即可把数据写到新前缀，旧 `yuewei/` 路径可由用户自行决定是否清理。
-- 删除 / 复活 tombstone 现在是本地概念，多设备间的冲突由 last-write-wins 自动收敛，不需要调用 `resolve_tombstone_revival`。
+- 删除 / 复活 tombstone 会跨设备传播，多设备间的并发写通过 ETag 条件写和重试收敛。
+- Envelope 大文件使用 `KMOENV2` 分块加密格式，上传、下载和 KEK 重包不再把整本书载入内存。
+- KEK 轮换先写入新命名空间，最后以单个 `_active_namespace.json` 条件写切换；失败时旧命名空间仍保持可读。
 - iOS simulator 构建可能出现 native object 的 SDK 版本高于 app deployment target 的 linker warning；当前发布验收将其视为非致命警告。
 - 不要把 `local.properties` 和真实密钥提交到 git。
