@@ -4,6 +4,9 @@ import com.sun.jna.Callback
 import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal actual class NativeKmoSyncBridge actual constructor(
@@ -18,7 +21,6 @@ internal actual class NativeKmoSyncBridge actual constructor(
     private val handle: Pointer
 
     init {
-        configureNativeSearchPath()
         handle = native.kmo_sync_create(
             config.storageConfigJson,
             config.encryptionConfigJson,
@@ -106,14 +108,6 @@ internal actual class NativeKmoSyncBridge actual constructor(
         }
     }
 
-    private fun configureNativeSearchPath() {
-        val nativeDir = System.getenv("KMO_SYNC_NATIVE_LIB_DIR")
-            ?: System.getProperty("kmo.sync.native.lib.dir")
-        if (!nativeDir.isNullOrBlank()) {
-            NativeLibraryPath.add(nativeDir)
-        }
-    }
-
     private fun interface NativeCallback : Callback {
         fun invoke(eventType: Int, jsonData: Pointer?, userData: Pointer?)
     }
@@ -171,19 +165,48 @@ internal actual class NativeKmoSyncBridge actual constructor(
         fun kmo_sync_free_string(value: Pointer?)
     }
 
-    private object NativeLibraryPath {
-        fun add(path: String) {
-            val property = "jna.library.path"
-            val current = System.getProperty(property).orEmpty()
-            val separator = System.getProperty("path.separator")
-            val next = if (current.isBlank()) path else "$path$separator$current"
-            System.setProperty(property, next)
-        }
-    }
-
     private companion object {
         val native: KmoSyncNative by lazy {
-            Native.load("kmo_sync", KmoSyncNative::class.java)
+            val nativeDir = System.getenv("KMO_SYNC_NATIVE_LIB_DIR")
+                ?: System.getProperty("kmo.sync.native.lib.dir")
+            if (!nativeDir.isNullOrBlank()) {
+                val property = "jna.library.path"
+                val current = System.getProperty(property).orEmpty()
+                val separator = System.getProperty("path.separator")
+                System.setProperty(
+                    property,
+                    if (current.isBlank()) nativeDir else "$nativeDir$separator$current",
+                )
+                Native.load("kmo_sync", KmoSyncNative::class.java)
+            } else {
+                Native.load(extractBundledLibrary(), KmoSyncNative::class.java)
+            }
+        }
+
+        private fun extractBundledLibrary(): String {
+            val osName = System.getProperty("os.name").lowercase(Locale.ROOT)
+            val os = when {
+                osName.contains("mac") -> "macos"
+                osName.contains("win") -> "windows"
+                else -> "linux"
+            }
+            val archName = System.getProperty("os.arch").lowercase(Locale.ROOT)
+            val arch = if (archName == "aarch64" || archName == "arm64") "aarch64" else "x86_64"
+            val libraryName = when (os) {
+                "macos" -> "libkmo_sync.dylib"
+                "windows" -> "kmo_sync.dll"
+                else -> "libkmo_sync.so"
+            }
+            val resourcePath = "native/$os-$arch/$libraryName"
+            val input = NativeKmoSyncBridge::class.java.classLoader
+                .getResourceAsStream(resourcePath)
+                ?: error("Bundled native library is missing: $resourcePath")
+            val directory = Files.createTempDirectory("kmo-sync-native")
+            val target = directory.resolve(libraryName)
+            input.use { Files.copy(it, target, StandardCopyOption.REPLACE_EXISTING) }
+            target.toFile().deleteOnExit()
+            directory.toFile().deleteOnExit()
+            return target.toAbsolutePath().toString()
         }
     }
 }

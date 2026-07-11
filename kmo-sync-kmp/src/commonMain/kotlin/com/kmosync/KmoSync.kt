@@ -1,17 +1,25 @@
 package com.kmosync
 
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
-class KmoSync(config: KmoSyncConfig) : AutoCloseable {
-    private val eventFlow = MutableSharedFlow<SyncEvent>(extraBufferCapacity = 64)
+class KmoSync(
+    config: KmoSyncConfig,
+    private val workerDispatcher: CoroutineDispatcher = Dispatchers.Default,
+) : AutoCloseable {
+    private val eventChannel = Channel<SyncEvent>(Channel.UNLIMITED)
+    private val nativeCallMutex = Mutex()
     private val native = NativeKmoSyncBridge(config) { event ->
-        eventFlow.tryEmit(event)
+        eventChannel.trySend(event)
     }
 
-    val events: Flow<SyncEvent> = eventFlow
+    val events: Flow<SyncEvent> = eventChannel.receiveAsFlow()
 
     suspend fun syncAll(mode: SyncMode): SyncResult = nativeCall {
         native.syncAll(mode.wireValue)
@@ -81,11 +89,14 @@ class KmoSync(config: KmoSyncConfig) : AutoCloseable {
 
     override fun close() {
         native.close()
+        eventChannel.close()
     }
 
     private suspend fun nativeCall(call: () -> Int): SyncResult =
-        withContext(Dispatchers.Default) {
-            resultFromCode(call())
+        withContext(workerDispatcher) {
+            nativeCallMutex.withLock {
+                resultFromCode(call())
+            }
         }
 
     private fun resultFromCode(code: Int): SyncResult =

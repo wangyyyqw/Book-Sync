@@ -18,6 +18,14 @@
 
 ### 修复
 
+- 修复标准 Android `assembleRelease` 不包含 `libkmo_sync.so` 的问题；AAR 构建现在自动触发三个 ABI 的 Rust 构建并校验产物。
+- 修复 Android 消费方开启 R8/minify 后 JNI 事件回调可能被改名的问题，AAR 现在携带 consumer keep 规则。
+- 修复 KMP iOS framework 在干净 checkout 中依赖预先存在 staticlib 的问题，link/cinterop task 会自动构建对应 Rust target。
+- 修复并发 KMP 调用可能组合出错误码 A 和错误文本 B 的问题；调用与取错串行化，FFI 错误同时按线程隔离。
+- 修复 iOS 在 `close()` 后抛异常、与 Android/JVM 返回失败不一致的问题；三个平台现在统一返回 `InvalidArg` 失败。
+- 修复订阅前或突发超过 64 条的同步事件静默丢失问题，事件改为无界队列并在关闭时终止 Flow。
+- 修复 JVM native smoke test 未配置外部库时直接跳过的问题；JAR 现在内置当前宿主 native 库，测试始终实际加载。
+- 修复阻塞 native 同步固定占用 `Dispatchers.Default` 的问题，`KmoSync` 允许注入专用 worker dispatcher。
 - 修复两台设备同时添加书签或划线时，最后一次无条件 PUT 覆盖另一台设备数据的问题。
 - 修复较新的远端划线评论或笔记内容被旧本地副本反向覆盖的问题。
 - 修复选择远端元数据版本时错误地将本地数据写回远端的问题。
@@ -37,9 +45,9 @@
 - S3/R2 和 WebDAV 的默认远端前缀由 `kmo_sync` 统一为文档所述的 `kmo-sync`。
 - 同一 ID 的书签、划线和笔记由较新的元数据快照获胜，同时保留另一侧独有的条目。
 - 本地同一同步实例的网络与轮换操作会串行执行；不同设备之间仍通过远端条件写并发协调。
-- Android `.so` 不再提交到仓库，必须通过 `kmo_sync/scripts/build_android.sh` 从当前 Rust 源码生成。
+- Android `.so` 不再提交到仓库，由 Gradle 在 Android 构建前从当前 Rust 源码自动生成。
 - `local.properties` 不再纳入版本控制，发布脚本会从 `ANDROID_HOME` 或默认 SDK 路径定位 Android SDK。
-- 发布验收现在覆盖格式检查、Clippy、Rust 全量测试、C ABI、KMP JVM、Android 三 ABI、Android 示例、iOS XCFramework 和 iOS 示例构建。
+- 发布验收现在覆盖格式检查、Clippy、Rust 全量测试、C ABI、自包含 KMP JVM、Android Release AAR 三 ABI、Android 示例、两个 KMP iOS framework、iOS XCFramework 和 iOS 示例构建。
 
 ### 兼容性说明
 
@@ -50,7 +58,7 @@
 
 ### 验证
 
-- 66 项 Rust 单元测试通过。
+- 67 项 Rust 单元测试通过。
 - 三本书的 phone → pad → phone 跨设备模拟通过。
 - 并发设备新增不同书签的收敛测试通过。
 - C ABI smoke test 和 FFI 跨设备测试通过。

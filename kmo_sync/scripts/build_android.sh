@@ -4,6 +4,10 @@ set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CRATE_DIR="$ROOT_DIR/kmo_sync"
 KMP_DIR="$ROOT_DIR/kmo-sync-kmp"
+ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+if [ -z "$ANDROID_HOME" ] && [ -f "$ROOT_DIR/local.properties" ]; then
+  ANDROID_HOME="$(sed -n 's/^sdk\.dir=//p' "$ROOT_DIR/local.properties" | head -1)"
+fi
 ANDROID_HOME="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 MIN_SDK_VERSION="${MIN_SDK_VERSION:-23}"
 

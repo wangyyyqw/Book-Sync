@@ -7,7 +7,7 @@
 - `commonMain`：共享 `KmoSync` API、配置类型、同步模式、事件和结果类型。
 - `androidMain`：通过 JNI 调用 `libkmo_sync.so`。
 - `jvmMain`：通过 JNA 调用 Rust 动态库。
-- iOS app：链接生成的 `KmoSync.xcframework`，通过 Swift/ObjC 调用 C ABI。示例 app 已经演示该方式。
+- `iosArm64` / `iosSimulatorArm64`：通过 cinterop 调用 Rust staticlib，也可供 Swift/ObjC app 使用生成的 framework。
 
 ## 添加到 KMP 应用
 
@@ -27,11 +27,10 @@ dependencies {
 
 ## Android 打包
 
-构建并复制 Android native 库：
+Gradle 会在 Android `preBuild` 前构建 Rust native 库。直接执行：
 
 ```bash
-cd ../kmo_sync
-./scripts/build_android.sh
+../gradle :kmo-sync-kmp:assembleRelease
 ```
 
 输出位置：
@@ -43,25 +42,17 @@ kmo-sync-kmp/src/androidMain/jniLibs/
 └── x86_64/libkmo_sync.so
 ```
 
-Android app 依赖 `:kmo-sync-kmp` 后，会自动打包这些 `.so` 文件。
+Android app 依赖 `:kmo-sync-kmp` 后，会自动打包这些 `.so` 文件；AAR 的 consumer R8 规则会保留 JNI 和事件回调入口。
 
 ## JVM 打包
 
-构建 Rust native 库：
+Gradle 会构建并打包当前宿主平台的 Rust native 库：
 
 ```bash
-cd ../kmo_sync
-cargo build --release
-```
-
-让 JNA 找到 native 库：
-
-```bash
-KMO_SYNC_NATIVE_LIB_DIR=/absolute/path/to/book-sync/kmo_sync/target/release \
 ../gradle :kmo-sync-kmp:jvmTest
 ```
 
-应用也可以设置 JVM system property：
+JAR 运行时会自动解压内置库。跨 OS 发布应使用 macOS、Linux、Windows CI runner 分别构建。也可以用 JVM system property 覆盖内置库：
 
 ```text
 -Dkmo.sync.native.lib.dir=/absolute/path/to/kmo_sync/target/release
@@ -69,14 +60,14 @@ KMO_SYNC_NATIVE_LIB_DIR=/absolute/path/to/book-sync/kmo_sync/target/release \
 
 ## iOS 打包
 
-构建 XCFramework：
+构建 KMP iOS framework（Gradle 会先构建 Rust staticlib）：
 
 ```bash
-cd ../kmo_sync
-./scripts/build_ios_xcframework.sh
+../gradle :kmo-sync-kmp:linkReleaseFrameworkIosArm64 \
+  :kmo-sync-kmp:linkReleaseFrameworkIosSimulatorArm64
 ```
 
-输出位置：
+纯 Swift/ObjC 接入需要 XCFramework 时仍可执行 `kmo_sync/scripts/build_ios_xcframework.sh`，输出位置：
 
 ```text
 kmo_sync/target/apple/KmoSync.xcframework
@@ -102,6 +93,8 @@ sync.syncSingleMeta("meta-id")
 sync.syncBook("book-hash")
 sync.close()
 ```
+
+可通过第二个构造参数传入 `Dispatchers.IO` 或专用 dispatcher 执行阻塞式 native 同步。`events` 使用不丢失的队列保留订阅前事件，一个 `KmoSync` 实例应只配置一个事件收集器。
 
 常用操作：
 

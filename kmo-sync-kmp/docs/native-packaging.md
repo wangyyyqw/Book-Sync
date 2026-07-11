@@ -2,11 +2,10 @@
 
 ## Android
 
-Build and copy Rust shared libraries into the KMP wrapper:
+Build the release AAR. Gradle builds all Rust shared libraries first:
 
 ```bash
-cd ../kmo_sync
-./scripts/build_android.sh
+../gradle :kmo-sync-kmp:assembleRelease
 ```
 
 Output:
@@ -18,14 +17,24 @@ kmo-sync-kmp/src/androidMain/jniLibs/
 └── x86_64/libkmo_sync.so
 ```
 
+The AAR also ships consumer R8 rules for JNI entry points and `onEvent`.
+
+## JVM
+
+`jvmJar` and `jvmTest` build the current host Rust library and package it under
+`native/<os>-<arch>/`. Runtime extraction is automatic. Use an OS/architecture CI
+matrix when publishing artifacts for more than one desktop platform.
+
 ## iOS
 
-Build the static libraries and package an xcframework:
+Build KMP frameworks; Gradle builds the matching Rust static library first:
 
 ```bash
-cd ../kmo_sync
-./scripts/build_ios_xcframework.sh
+../gradle :kmo-sync-kmp:linkReleaseFrameworkIosArm64 \
+  :kmo-sync-kmp:linkReleaseFrameworkIosSimulatorArm64
 ```
+
+For the standalone C ABI XCFramework, run `kmo_sync/scripts/build_ios_xcframework.sh`.
 
 Output:
 

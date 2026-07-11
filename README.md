@@ -239,14 +239,13 @@ dependencies {
 
 ### 2. Android 引用 native 库
 
-构建 Android `.so`：
+直接构建 AAR：
 
 ```bash
-cd kmo_sync
-./scripts/build_android.sh
+gradle :kmo-sync-kmp:assembleRelease
 ```
 
-脚本会把库复制到：
+Gradle 会先调用 Rust Android 构建并把三个 ABI 自动装入 AAR：
 
 ```text
 kmo-sync-kmp/src/androidMain/jniLibs/
@@ -255,25 +254,19 @@ kmo-sync-kmp/src/androidMain/jniLibs/
 └── x86_64/libkmo_sync.so
 ```
 
-Android 应用依赖 `:kmo-sync-kmp` 后，会自动把这些 `.so` 打进 APK/AAB。仓库不提交预构建 `.so`；源码依赖和发布流水线必须先运行上述脚本，确保 native 库与当前 Rust 源码一致。
+Android 应用依赖 `:kmo-sync-kmp` 后，会自动把这些 `.so` 打进 APK/AAB。仓库不提交预构建 `.so`；Gradle 的 Android `preBuild` 会保证 native 库与当前 Rust 源码一致。AAR 同时携带 consumer R8 规则，保留 JNI 入口和事件回调方法名。
 
 ### 3. JVM 桌面端引用 native 库
 
-先构建 Rust release 库：
+直接构建或测试 JVM 产物：
 
 ```bash
-cd kmo_sync
-cargo build --release
-```
-
-运行 JVM 代码时，让 JNA 找到 native 库目录：
-
-```bash
-KMO_SYNC_NATIVE_LIB_DIR=/absolute/path/to/book-sync/kmo_sync/target/release \
 gradle :kmo-sync-kmp:jvmTest
 ```
 
-桌面应用可以设置环境变量 `KMO_SYNC_NATIVE_LIB_DIR`，也可以设置 JVM system property：
+Gradle 会构建当前宿主平台的 Rust 动态库并装入 JAR，运行时自动解压加载。发布 macOS、Linux 和 Windows 的完整产物时，应在对应系统的 CI runner 分别构建；单个 runner 只生成当前 OS/架构的 native 资源。
+
+开发或诊断时仍可用环境变量 `KMO_SYNC_NATIVE_LIB_DIR`，或 JVM system property 覆盖内置库：
 
 ```text
 -Dkmo.sync.native.lib.dir=/absolute/path/to/kmo_sync/target/release
@@ -294,7 +287,7 @@ cd kmo_sync
 kmo_sync/target/apple/KmoSync.xcframework
 ```
 
-KMP 模块现在包含 `iosArm64` 和 `iosSimulatorArm64` target，并通过 cinterop 链接对应 Rust staticlib。纯 Swift 项目也可以把 `KmoSync.xcframework` 加入 app target，并通过下面的头文件接入 C ABI：
+KMP 模块包含 `iosArm64` 和 `iosSimulatorArm64` target；执行 `linkReleaseFrameworkIosArm64` 或 `linkReleaseFrameworkIosSimulatorArm64` 时，Gradle 会自动构建并链接对应 Rust staticlib。纯 Swift 项目也可以把 `KmoSync.xcframework` 加入 app target，并通过下面的头文件接入 C ABI：
 
 ```text
 kmo_sync/target/include/kmo_sync.h
@@ -339,6 +332,8 @@ val result = sync.syncAll(SyncMode.Bidirectional)
 val stateJson = sync.getSyncState()
 sync.close()
 ```
+
+`KmoSync` 的阻塞式 native 调用会切换到构造函数的 `workerDispatcher`。Android/JVM 应用可传入 `Dispatchers.IO` 或自己的有界线程池，避免多本大书同步占用默认计算线程池。`events` 会缓存订阅前和突发事件；一个实例应由一个事件收集器消费。
 
 ### 6. 常用 KMP 操作
 

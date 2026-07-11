@@ -4,6 +4,7 @@ use crate::SyncError;
 use crate::event::{EventCallback, EventEmitter};
 use crate::facade::{KmoSyncConfig, KmoSyncFacade};
 use crate::model::BookReadingMeta;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -19,6 +20,9 @@ pub struct KmoSyncHandle {
 
 static HANDLES: OnceLock<Mutex<HashMap<usize, Arc<KmoSyncHandle>>>> = OnceLock::new();
 static NEXT_HANDLE_ID: AtomicUsize = AtomicUsize::new(1);
+thread_local! {
+    static THREAD_LAST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
+}
 
 #[allow(non_camel_case_types)]
 pub type kmo_sync_t = KmoSyncHandle;
@@ -62,6 +66,15 @@ pub extern "C" fn kmo_sync_destroy(sync: *mut kmo_sync_t) {
     if let Ok(mut handles) = handle_registry().lock() {
         handles.remove(&(sync as usize));
     }
+    THREAD_LAST_ERROR.with(|last_error| {
+        if last_error
+            .borrow()
+            .as_ref()
+            .is_some_and(|(handle_id, _)| *handle_id == sync as usize)
+        {
+            *last_error.borrow_mut() = None;
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
@@ -265,7 +278,7 @@ pub extern "C" fn kmo_sync_rotate_envelope_kek(
         Ok(_) => 0,
         Err(err) => {
             let code = err.code();
-            set_last_error(&handle, err.to_string());
+            set_last_error(sync, &handle, err.to_string());
             code
         }
     }
@@ -311,7 +324,7 @@ pub extern "C" fn kmo_sync_get_local_meta(
     match handle.facade.get_local_meta_json(&meta_id) {
         Ok(json) => string_to_raw(json),
         Err(err) => {
-            set_last_error(&handle, err.to_string());
+            set_last_error(sync, &handle, err.to_string());
             ptr::null_mut()
         }
     }
@@ -329,7 +342,7 @@ pub extern "C" fn kmo_sync_get_sync_state(sync: *mut kmo_sync_t) -> *mut c_char 
     match handle.facade.get_sync_state_json() {
         Ok(json) => string_to_raw(json),
         Err(err) => {
-            set_last_error(&handle, err.to_string());
+            set_last_error(sync, &handle, err.to_string());
             ptr::null_mut()
         }
     }
@@ -343,11 +356,21 @@ pub extern "C" fn kmo_sync_last_error(sync: *mut kmo_sync_t) -> *mut c_char {
     let Some(handle) = get_handle(sync) else {
         return string_to_raw("sync handle is closed".to_string());
     };
-    let message = handle
-        .last_error
-        .lock()
-        .map(|value| value.clone().unwrap_or_default())
-        .unwrap_or_else(|_| "last-error mutex poisoned".to_string());
+    let message = THREAD_LAST_ERROR
+        .with(|last_error| {
+            last_error
+                .borrow()
+                .as_ref()
+                .filter(|(handle_id, _)| *handle_id == sync as usize)
+                .map(|(_, message)| message.clone())
+        })
+        .unwrap_or_else(|| {
+            handle
+                .last_error
+                .lock()
+                .map(|value| value.clone().unwrap_or_default())
+                .unwrap_or_else(|_| "last-error mutex poisoned".to_string())
+        });
     string_to_raw(message)
 }
 
@@ -410,7 +433,7 @@ where
         Ok(()) => 0,
         Err(err) => {
             let code = err.code();
-            set_last_error(&handle, err.to_string());
+            set_last_error(sync, &handle, err.to_string());
             code
         }
     }
@@ -419,7 +442,7 @@ where
 fn set_error(sync: *mut kmo_sync_t, err: SyncError) -> i32 {
     let code = err.code();
     if let Some(handle) = get_handle(sync) {
-        set_last_error(&handle, err.to_string());
+        set_last_error(sync, &handle, err.to_string());
     }
     code
 }
@@ -439,7 +462,10 @@ fn get_handle(sync: *mut kmo_sync_t) -> Option<Arc<KmoSyncHandle>> {
         .cloned()
 }
 
-fn set_last_error(handle: &KmoSyncHandle, message: String) {
+fn set_last_error(sync: *mut kmo_sync_t, handle: &KmoSyncHandle, message: String) {
+    THREAD_LAST_ERROR.with(|last_error| {
+        *last_error.borrow_mut() = Some((sync as usize, message.clone()));
+    });
     if let Ok(mut last_error) = handle.last_error.lock() {
         *last_error = Some(message);
     }
@@ -464,6 +490,7 @@ fn string_to_raw(s: String) -> *mut c_char {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn ffi_create_destroy_smoke() {
@@ -517,5 +544,50 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(kmo_sync_all(id as *mut kmo_sync_t, 0), 5);
+    }
+
+    #[test]
+    fn ffi_last_error_is_isolated_per_calling_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = CString::new(r#"{"type":"memory"}"#).unwrap();
+        let encryption = CString::new(r#"{"type":"none"}"#).unwrap();
+        let device = CString::new("device-errors").unwrap();
+        let cache = CString::new(dir.path().to_string_lossy().to_string()).unwrap();
+        let handle = kmo_sync_create(
+            storage.as_ptr(),
+            encryption.as_ptr(),
+            device.as_ptr(),
+            cache.as_ptr(),
+            None,
+            ptr::null_mut(),
+        );
+        let id = handle as usize;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let run = |operation: extern "C" fn(*mut kmo_sync_t, i32) -> i32| {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                assert_eq!(operation(id as *mut kmo_sync_t, 99), 5);
+                barrier.wait();
+                let raw = kmo_sync_last_error(id as *mut kmo_sync_t);
+                let message = unsafe { CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned();
+                kmo_sync_free_string(raw);
+                message
+            })
+        };
+
+        let sync_mode_error = run(kmo_sync_all);
+        let network_type_error = run(kmo_sync_set_network_type);
+        let sync_mode_error = sync_mode_error.join().unwrap();
+        let network_type_error = network_type_error.join().unwrap();
+        assert!(sync_mode_error.contains("sync mode"), "{sync_mode_error}");
+        assert!(
+            network_type_error.contains("network type"),
+            "{network_type_error}"
+        );
+        assert_ne!(sync_mode_error, network_type_error);
+        kmo_sync_destroy(handle);
     }
 }

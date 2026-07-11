@@ -31,37 +31,40 @@ internal actual class NativeKmoSyncBridge actual constructor(
         callbackRef.asCPointer(),
     ) ?: error("kmo_sync_create returned null")
 
-    actual fun syncAll(mode: Int): Int = withHandle { kmo_sync_all(it, mode) }
+    actual fun syncAll(mode: Int): Int = withHandleCode { kmo_sync_all(it, mode) }
     actual fun syncSingleMeta(bookHash: String, metaId: String): Int =
-        withHandle { kmo_sync_single_meta(it, bookHash, metaId) }
-    actual fun syncBook(bookHash: String): Int = withHandle { kmo_sync_book(it, bookHash) }
+        withHandleCode { kmo_sync_single_meta(it, bookHash, metaId) }
+    actual fun syncBook(bookHash: String): Int = withHandleCode { kmo_sync_book(it, bookHash) }
     actual fun putLocalBook(bookHash: String, localFilePath: String): Int =
-        withHandle { kmo_sync_put_local_book(it, bookHash, localFilePath) }
+        withHandleCode { kmo_sync_put_local_book(it, bookHash, localFilePath) }
     actual fun putLocalMetaJson(metaJson: String): Int =
-        withHandle { kmo_sync_put_local_meta_json(it, metaJson) }
+        withHandleCode { kmo_sync_put_local_meta_json(it, metaJson) }
     actual fun resolveMetaConflict(metaId: String, chosenVersion: String): Int =
-        withHandle { kmo_sync_resolve_meta_file_conflict(it, metaId, chosenVersion) }
+        withHandleCode { kmo_sync_resolve_meta_file_conflict(it, metaId, chosenVersion) }
     actual fun resolveBlobConflict(bookHash: String, chosenVersion: String): Int =
-        withHandle { kmo_sync_resolve_blob_conflict(it, bookHash, chosenVersion) }
+        withHandleCode { kmo_sync_resolve_blob_conflict(it, bookHash, chosenVersion) }
     actual fun rotateEnvelopeKek(newEncryptionConfigJson: String): Int =
-        withHandle { kmo_sync_rotate_envelope_kek(it, newEncryptionConfigJson) }
+        withHandleCode { kmo_sync_rotate_envelope_kek(it, newEncryptionConfigJson) }
     actual fun markMetaItemDeleted(metaId: String, itemType: String, itemUuid: String): Int =
-        withHandle { kmo_sync_mark_meta_item_deleted(it, metaId, itemType, itemUuid) }
+        withHandleCode { kmo_sync_mark_meta_item_deleted(it, metaId, itemType, itemUuid) }
     actual fun undoDeletion(metaId: String, itemUuid: String): Int =
-        withHandle { kmo_sync_undo_deletion(it, metaId, itemUuid) }
+        withHandleCode { kmo_sync_undo_deletion(it, metaId, itemUuid) }
     actual fun resolveTombstoneRevival(metaId: String, itemUuid: String, resolution: String): Int =
-        withHandle { kmo_sync_resolve_tombstone_revival(it, metaId, itemUuid, resolution) }
+        withHandleCode { kmo_sync_resolve_tombstone_revival(it, metaId, itemUuid, resolution) }
     actual fun setNetworkType(networkType: Int): Int =
-        withHandle { kmo_sync_set_network_type(it, networkType) }
+        withHandleCode { kmo_sync_set_network_type(it, networkType) }
     actual fun setBlobByteLimit(byteLimit: Long): Int =
-        withHandle { kmo_sync_set_blob_byte_limit(it, byteLimit) }
-    actual fun pause(): Int = withHandle { kmo_sync_pause(it) }
-    actual fun resume(): Int = withHandle { kmo_sync_resume(it) }
+        withHandleCode { kmo_sync_set_blob_byte_limit(it, byteLimit) }
+    actual fun pause(): Int = withHandleCode { kmo_sync_pause(it) }
+    actual fun resume(): Int = withHandleCode { kmo_sync_resume(it) }
 
     actual fun getLocalMeta(metaId: String): String? =
-        withHandle { consumeNativeString(kmo_sync_get_local_meta(it, metaId)) }
-    actual fun getSyncState(): String? = withHandle { consumeNativeString(kmo_sync_get_sync_state(it)) }
-    actual fun lastError(): String = withHandle { consumeNativeString(kmo_sync_last_error(it)).orEmpty() }
+        withHandleOrNull { consumeNativeString(kmo_sync_get_local_meta(it, metaId)) }
+    actual fun getSyncState(): String? =
+        withHandleOrNull { consumeNativeString(kmo_sync_get_sync_state(it)) }
+    actual fun lastError(): String =
+        withHandleOrNull { consumeNativeString(kmo_sync_last_error(it)).orEmpty() }
+            ?: "KmoSync is closed"
 
     actual override fun close() {
         lock.lock()
@@ -75,12 +78,19 @@ internal actual class NativeKmoSyncBridge actual constructor(
         }
     }
 
-    private fun requireHandle(): CPointer<kmo_sync_t> = checkNotNull(handle) { "KmoSync is closed" }
-
-    private inline fun <T> withHandle(block: (CPointer<kmo_sync_t>) -> T): T {
+    private inline fun withHandleCode(block: (CPointer<kmo_sync_t>) -> Int): Int {
         lock.lock()
         return try {
-            block(requireHandle())
+            handle?.let(block) ?: ErrorCode.InvalidArg.code
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    private inline fun <T> withHandleOrNull(block: (CPointer<kmo_sync_t>) -> T): T? {
+        lock.lock()
+        return try {
+            handle?.let(block)
         } finally {
             lock.unlock()
         }
