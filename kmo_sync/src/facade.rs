@@ -408,6 +408,17 @@ impl KmoSyncFacade {
         if let Some(previous) = previous {
             let mut previous = previous;
             normalize_meta_pairs(&mut previous);
+            // LWW depends on monotonic clocks: never let a caller write the
+            // meta with a wall_clock_ts/logical_ts older than what this device
+            // already has. A regressed clock would make stale remote content
+            // win every comparison (silent progress regression) and would let
+            // an old revival suppress a fresh deletion.
+            if meta.wall_clock_ts < previous.wall_clock_ts {
+                meta.wall_clock_ts = previous.wall_clock_ts;
+            }
+            if meta.logical_ts < previous.logical_ts {
+                meta.logical_ts = previous.logical_ts;
+            }
             if previous.progress == meta.progress {
                 meta.progress_write_ts = previous.progress_write_ts;
                 meta.progress_writer_device = previous.progress_writer_device;
@@ -544,9 +555,29 @@ impl KmoSyncFacade {
         let mut meta = self
             .read_local_meta(meta_id)?
             .ok_or_else(|| SyncError::InvalidArg(format!("local meta not found: {meta_id}")))?;
+        // Read the tombstone set up front: the new tombstone's logical_ts must
+        // be strictly greater than every known tombstone/revival on this
+        // device, or a regressed caller clock would let an old revival
+        // suppress the fresh deletion (is_revived misjudgement).
+        let mut set = TombstoneSet::default();
+        let local_tombstones = self.local_tombstone_path(meta_id);
+        if local_tombstones.exists() {
+            set = TombstoneSet::decode(&std::fs::read(&local_tombstones)?)?;
+        }
         let deleted_item_json = snapshot_meta_item(&meta, &item_type, item_uuid)?;
         remove_meta_item(&mut meta, &item_type, item_uuid);
-        meta.logical_ts += 1;
+        let max_known_logical = set
+            .tombstones
+            .iter()
+            .map(|tombstone| tombstone.deleted_at_logical_ts)
+            .chain(
+                set.revivals
+                    .iter()
+                    .map(|revival| revival.revived_at_logical_ts),
+            )
+            .max()
+            .unwrap_or(0);
+        meta.logical_ts = meta.logical_ts.max(max_known_logical) + 1;
         meta.modified_ts = meta.modified_ts.max(meta.logical_ts);
         meta.wall_clock_ts = now_millis();
         meta.device_id = self.device_id().to_string();
@@ -555,11 +586,6 @@ impl KmoSyncFacade {
         // Tombstones are kept local-only; the deletion itself rides along inside
         // the next bookmarks sync (the item was already removed from `meta`
         // above by remove_meta_item, so the lww PUT will overwrite remote).
-        let mut set = TombstoneSet::default();
-        let local_tombstones = self.local_tombstone_path(meta_id);
-        if local_tombstones.exists() {
-            set = TombstoneSet::decode(&std::fs::read(&local_tombstones)?)?;
-        }
         let mut tombstone = Tombstone::new(
             item_uuid.to_string(),
             item_type,
