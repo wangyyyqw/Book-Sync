@@ -18,4 +18,3 @@ rootProject.name = "Book Sync"
 
 include(":kmo-sync-kmp")
 include(":samples:kmp-reader-sync:androidApp")
-include(":samples:guanzhi-sync-demo")
