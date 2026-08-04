@@ -135,6 +135,10 @@ fn r2_two_devices_meta_bidirectional_sync() {
         logical_ts: 1,
         origin_device_id: "r2-device-a".to_string(),
         edit_history: vec![],
+        bookmarks_write_ts: 1,
+        bookmarks_writer_device: "r2-device-a".to_string(),
+        progress_write_ts: 1,
+        progress_writer_device: "r2-device-a".to_string(),
     };
 
     facade_a.put_local_meta(&meta).unwrap();
@@ -192,6 +196,10 @@ fn r2_envelope_encryption_two_devices_meta_sync() {
         logical_ts: 7,
         origin_device_id: "r2-enc-a".to_string(),
         edit_history: vec![],
+        bookmarks_write_ts: 7,
+        bookmarks_writer_device: "r2-enc-a".to_string(),
+        progress_write_ts: 7,
+        progress_writer_device: "r2-enc-a".to_string(),
     };
 
     facade_a.put_local_meta(&meta).unwrap();
@@ -368,6 +376,10 @@ fn r2_envelope_kek_rotation() {
         logical_ts: 9,
         origin_device_id: "r2-rotate".to_string(),
         edit_history: vec![],
+        bookmarks_write_ts: 9,
+        bookmarks_writer_device: "r2-rotate".to_string(),
+        progress_write_ts: 9,
+        progress_writer_device: "r2-rotate".to_string(),
     };
     facade.put_local_meta(&meta).unwrap();
     facade.sync_all(SYNC_MODE_PUSH_ONLY).unwrap();
@@ -456,6 +468,10 @@ fn r2_real_epub_two_devices_metadata_and_blob_roundtrip() {
         logical_ts: 100,
         origin_device_id: "r2-realbook-a".to_string(),
         edit_history: vec![],
+        bookmarks_write_ts: 100,
+        bookmarks_writer_device: "r2-realbook-a".to_string(),
+        progress_write_ts: 100,
+        progress_writer_device: "r2-realbook-a".to_string(),
     };
     facade_a.put_local_meta(&meta).unwrap();
 
@@ -826,6 +842,10 @@ fn run_r2_book_scenario(
             logical_ts: 100,
             op: None,
         }],
+        bookmarks_write_ts: 100,
+        bookmarks_writer_device: "r2-phone-iphone".to_string(),
+        progress_write_ts: 100,
+        progress_writer_device: "r2-phone-iphone".to_string(),
     };
     phone.put_local_meta(&meta_p1).unwrap();
     phone.sync_book(book_hash).expect("phone sync_book push");

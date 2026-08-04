@@ -406,6 +406,10 @@ fn base_meta(meta_id: &str, book_hash: &str, device_id: &str, ts: i64) -> BookRe
         logical_ts: ts,
         origin_device_id: device_id.to_string(),
         edit_history: vec![simple_edit(&format!("init-{meta_id}"), device_id, ts)],
+        bookmarks_write_ts: ts,
+        bookmarks_writer_device: device_id.to_string(),
+        progress_write_ts: ts,
+        progress_writer_device: device_id.to_string(),
     }
 }
 

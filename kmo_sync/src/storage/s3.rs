@@ -115,22 +115,21 @@ impl RemoteStorage for S3Storage {
 
     async fn read_object_versioned(&self, remote_path: &str) -> Result<Option<VersionedObject>> {
         let p = self.full_path(remote_path)?;
-        match self.inner.get(&p).await {
-            Ok(result) => {
-                let version = RemoteVersion {
-                    etag: result.meta.e_tag.clone(),
-                    version: result.meta.version.clone(),
-                };
-                let data = result
-                    .bytes()
-                    .await
-                    .map_err(map_object_store_error)?
-                    .to_vec();
-                Ok(Some(VersionedObject { data, version }))
+        with_retry("read_object_versioned", || async {
+            match self.inner.get(&p).await {
+                Ok(result) => {
+                    let version = RemoteVersion {
+                        etag: result.meta.e_tag.clone(),
+                        version: result.meta.version.clone(),
+                    };
+                    let data = result.bytes().await?.to_vec();
+                    Ok(Some(VersionedObject { data, version }))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(err) => Err(err),
             }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(err) => Err(map_object_store_error(err)),
-        }
+        })
+        .await
     }
 
     async fn write_object(&self, remote_path: &str, data: &[u8]) -> Result<()> {

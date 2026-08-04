@@ -400,16 +400,37 @@ impl RemoteStorage for WebDavStorage {
     }
 
     async fn download_large(&self, remote_path: &str) -> Result<Box<dyn AsyncRead + Unpin + Send>> {
-        let response = self
-            .apply_auth(self.client.get(self.url_for_remote_path(remote_path)?))
-            .send()
-            .await
-            .map_err(map_reqwest_error)?;
-        if !response.status().is_success() {
-            return Err(http_status_error(response.status(), "streaming GET"));
+        const MAX_ATTEMPTS: u32 = 4;
+        let mut attempt = 0;
+        loop {
+            let request = self.apply_auth(self.client.get(self.url_for_remote_path(remote_path)?));
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    let stream = response.bytes_stream().map_err(std::io::Error::other);
+                    return Ok(Box::new(tokio_util::io::StreamReader::new(stream)));
+                }
+                Ok(response)
+                    if is_retryable_status(response.status()) && attempt + 1 < MAX_ATTEMPTS =>
+                {
+                    let status = response.status();
+                    let backoff = Duration::from_millis(120_u64 << attempt);
+                    eprintln!(
+                        "[webdav / streaming GET] attempt {attempt} returned HTTP {status}; retry in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Ok(response) => return Err(http_status_error(response.status(), "streaming GET")),
+                Err(err) if is_retryable_reqwest_error(&err) && attempt + 1 < MAX_ATTEMPTS => {
+                    let backoff = Duration::from_millis(120_u64 << attempt);
+                    eprintln!(
+                        "[webdav / streaming GET] attempt {attempt} failed: {err}; retry in {backoff:?}"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(err) => return Err(map_reqwest_error(err)),
+            }
+            attempt += 1;
         }
-        let stream = response.bytes_stream().map_err(std::io::Error::other);
-        Ok(Box::new(tokio_util::io::StreamReader::new(stream)))
     }
 }
 

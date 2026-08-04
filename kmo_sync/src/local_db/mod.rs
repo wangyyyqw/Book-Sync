@@ -2,7 +2,7 @@ use crate::Result;
 use rusqlite::{Connection, params};
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub fn open_database(local_cache_dir: &Path) -> Result<Connection> {
     std::fs::create_dir_all(local_cache_dir)?;
@@ -29,7 +29,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             last_remote_size INTEGER NOT NULL DEFAULT 0,
             last_remote_etag TEXT,
             last_sync_mtime INTEGER NOT NULL DEFAULT 0,
-            local_file_path TEXT NOT NULL
+            local_file_path TEXT NOT NULL,
+            adopted_remote INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS meta_index (
@@ -104,6 +105,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 value TEXT NOT NULL
             )",
             [],
+        )?;
+    }
+    if version < 4 {
+        add_column_if_missing(
+            conn,
+            "blob_index",
+            "adopted_remote",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
     }
     if version < CURRENT_SCHEMA_VERSION {

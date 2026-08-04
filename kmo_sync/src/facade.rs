@@ -397,7 +397,35 @@ impl KmoSyncFacade {
     pub fn put_local_meta(&self, meta: &BookReadingMeta) -> Result<()> {
         validate_identifier(&meta.meta_id, "meta_id")?;
         validate_identifier(&meta.book_hash, "book_hash")?;
-        let meta = self.meta_with_archived_history(meta)?;
+        let previous = self.read_local_meta_priv(&meta.meta_id)?;
+        let mut meta = self.meta_with_archived_history(meta)?;
+        normalize_meta_pairs(&mut meta);
+        // Only re-stamp the envelope(s) whose content actually changed, and
+        // stamp them with the caller's own (wall_clock_ts, device_id). A
+        // bookmarks-only write must not claim a newer progress timestamp, or
+        // stale progress content would beat genuinely newer progress written
+        // by other devices (LWW regression).
+        if let Some(previous) = previous {
+            let mut previous = previous;
+            normalize_meta_pairs(&mut previous);
+            if previous.progress == meta.progress {
+                meta.progress_write_ts = previous.progress_write_ts;
+                meta.progress_writer_device = previous.progress_writer_device;
+            } else {
+                meta.progress_write_ts = meta.wall_clock_ts;
+                meta.progress_writer_device = meta.device_id.clone();
+            }
+            if previous.bookmarks == meta.bookmarks
+                && previous.highlights == meta.highlights
+                && previous.notes == meta.notes
+            {
+                meta.bookmarks_write_ts = previous.bookmarks_write_ts;
+                meta.bookmarks_writer_device = previous.bookmarks_writer_device;
+            } else {
+                meta.bookmarks_write_ts = meta.wall_clock_ts;
+                meta.bookmarks_writer_device = meta.device_id.clone();
+            }
+        }
         let bytes = encode_meta(&meta)?;
         let path = self.local_meta_path(&meta.meta_id);
         if let Some(parent) = path.parent() {
@@ -606,6 +634,10 @@ impl KmoSyncFacade {
         item_uuid: &str,
         resolution: &str,
     ) -> Result<()> {
+        let _operation = self
+            .operation_lock
+            .lock()
+            .map_err(|_| SyncError::Internal("operation mutex poisoned".to_string()))?;
         if meta_id.trim().is_empty() {
             return Err(SyncError::InvalidArg("meta_id is empty".to_string()));
         }
@@ -743,6 +775,32 @@ impl KmoSyncFacade {
                 stat.mtime,
                 &local_path.to_string_lossy(),
             )?;
+            self.mark_blob_not_adopted(book_hash)?;
+        } else {
+            // Choosing the remote version must actually materialize it: the
+            // previous code only cleared the conflict row, so the very next
+            // sync re-downloaded the remote blob, re-detected the hash
+            // mismatch and re-recorded the conflict forever. Adopt the remote
+            // blob into the local cache (content is not hash-verified) and
+            // mark the index so `sync_book` treats it as synced.
+            let remote_path = self.remote_book_path(book_hash);
+            let local_path = self.local_book_path(book_hash);
+            if self.runtime.block_on(self.storage.exists(&remote_path))? {
+                let (_, _) = self.runtime.block_on(self.download_book_file(
+                    &remote_path,
+                    Some(&local_path),
+                    None,
+                ))?;
+                let stat = self.runtime.block_on(self.storage.stat(&remote_path))?;
+                self.upsert_blob_index(
+                    book_hash,
+                    stat.size as i64,
+                    stat.etag.as_deref(),
+                    stat.mtime,
+                    &local_path.to_string_lossy(),
+                )?;
+                self.mark_blob_adopted(book_hash)?;
+            }
         }
 
         self.mark_conflict_resolved(conflict_id)?;
@@ -834,7 +892,26 @@ impl KmoSyncFacade {
         if !path.exists() {
             return Ok(None);
         }
-        Ok(Some(decode_meta(&std::fs::read(path)?)?))
+        let mut meta = decode_meta(&std::fs::read(path)?)?;
+        // Rejoin the archived edit history so callers never observe the
+        // inline-truncated view (the archive used to be written but never
+        // read back, silently losing history past the inline limit).
+        let archive_path = self.local_history_path(meta_id);
+        if archive_path.exists()
+            && let Ok(archive) = std::fs::read(&archive_path)
+            && let Ok(archived) = decode_edit_history_archive(&archive)
+        {
+            let mut known: std::collections::HashSet<String> =
+                archived.iter().map(|edit| edit.edit_id.clone()).collect();
+            let mut restored = archived;
+            for edit in meta.edit_history {
+                if known.insert(edit.edit_id.clone()) {
+                    restored.push(edit);
+                }
+            }
+            meta.edit_history = restored;
+        }
+        Ok(Some(meta))
     }
 
     fn local_meta_path(&self, meta_id: &str) -> PathBuf {
@@ -1069,6 +1146,10 @@ impl KmoSyncFacade {
         } else {
             None
         };
+        let mut local = local;
+        if let Some(local_meta) = &mut local {
+            normalize_meta_pairs(local_meta);
+        }
 
         let versioned_progress = self.read_remote_progress(book_hash).await?;
         let versioned_bookmarks = self.read_remote_bookmarks(book_hash).await?;
@@ -1096,6 +1177,16 @@ impl KmoSyncFacade {
             merged_tombstones.merge(rt.clone());
         }
         merged_tombstones.gc_expired();
+
+        // Nothing exists on either side: don't materialize a phantom empty
+        // meta file for a book that was never synced.
+        if local.is_none()
+            && versioned_progress.value.is_none()
+            && versioned_bookmarks.value.is_none()
+            && merged_tombstones.is_empty()
+        {
+            return Ok(true);
+        }
 
         let tombstone_local_changed = merged_tombstones != local_tombstones;
         if tombstone_local_changed {
@@ -1300,8 +1391,8 @@ impl KmoSyncFacade {
             schema_version: REMOTE_PROTOCOL_VERSION,
             book_hash: meta.book_hash.clone(),
             progress: meta.progress.clone(),
-            last_writer_device_id: meta.device_id.clone(),
-            last_write_ts: meta.wall_clock_ts,
+            last_writer_device_id: meta.progress_writer_device.clone(),
+            last_write_ts: meta.progress_write_ts,
         };
         let bytes = serde_json::to_vec(&payload)?;
         let encrypted = self.crypto().encrypt(&bytes)?;
@@ -1337,8 +1428,8 @@ impl KmoSyncFacade {
             bookmarks: meta.bookmarks.clone(),
             highlights: meta.highlights.clone(),
             notes: meta.notes.clone(),
-            last_writer_device_id: meta.device_id.clone(),
-            last_write_ts: meta.wall_clock_ts,
+            last_writer_device_id: meta.bookmarks_writer_device.clone(),
+            last_write_ts: meta.bookmarks_write_ts,
         };
         let bytes = serde_json::to_vec(&payload)?;
         let encrypted = self.crypto().encrypt(&bytes)?;
@@ -1394,8 +1485,8 @@ impl KmoSyncFacade {
             schema_version: REMOTE_PROTOCOL_VERSION,
             book_hash: meta.book_hash.clone(),
             progress: meta.progress.clone(),
-            last_writer_device_id: meta.device_id.clone(),
-            last_write_ts: meta.wall_clock_ts,
+            last_writer_device_id: meta.progress_writer_device.clone(),
+            last_write_ts: meta.progress_write_ts,
         };
         let encrypted = self.crypto().encrypt(&serde_json::to_vec(&payload)?)?;
         self.storage
@@ -1418,8 +1509,8 @@ impl KmoSyncFacade {
             bookmarks: meta.bookmarks.clone(),
             highlights: meta.highlights.clone(),
             notes: meta.notes.clone(),
-            last_writer_device_id: meta.device_id.clone(),
-            last_write_ts: meta.wall_clock_ts,
+            last_writer_device_id: meta.bookmarks_writer_device.clone(),
+            last_write_ts: meta.bookmarks_write_ts,
         };
         let encrypted = self.crypto().encrypt(&serde_json::to_vec(&payload)?)?;
         self.storage
@@ -1460,7 +1551,7 @@ impl KmoSyncFacade {
 
         if mode != SyncMode::PullOnly && source_path.exists() {
             let actual_hash = blake3_file_hex(source_path)?;
-            if actual_hash != book_hash {
+            if actual_hash != book_hash && !self.is_blob_adopted(book_hash)? {
                 return Err(SyncError::InvalidArg(format!(
                     "local book hash mismatch: expected {book_hash}, got {actual_hash}"
                 )));
@@ -1517,7 +1608,7 @@ impl KmoSyncFacade {
             }
             if self.storage.exists(&remote_path).await? {
                 let (remote_hash, remote_size) = self
-                    .download_book_file(&remote_path, None, book_hash)
+                    .download_book_file(&remote_path, None, Some(book_hash))
                     .await?;
                 if remote_hash != book_hash {
                     self.record_blob_conflict(
@@ -1551,7 +1642,7 @@ impl KmoSyncFacade {
 
         if mode != SyncMode::PushOnly && self.storage.exists(&remote_path).await? {
             let (actual_hash, size) = self
-                .download_book_file(&remote_path, Some(&local_path), book_hash)
+                .download_book_file(&remote_path, Some(&local_path), Some(book_hash))
                 .await?;
             if actual_hash != book_hash {
                 self.record_blob_conflict(book_hash, None, 0, &actual_hash, size)?;
@@ -1593,7 +1684,7 @@ impl KmoSyncFacade {
         &self,
         remote_path: &str,
         destination: Option<&Path>,
-        expected_hash: &str,
+        expected_hash: Option<&str>,
     ) -> Result<(String, u64)> {
         let encrypted_path = self.transfer_path("download-encrypted");
         let plaintext_path = self.transfer_path("download-plain");
@@ -1609,7 +1700,14 @@ impl KmoSyncFacade {
         decrypt_result?;
         let size = std::fs::metadata(&plaintext_path)?.len();
         let hash = blake3_file_hex(&plaintext_path)?;
-        if let Some(destination) = destination.filter(|_| hash == expected_hash) {
+        // `expected_hash == None` forces adoption of the remote blob even when
+        // its content does not match the book hash (blob conflict resolution
+        // in favor of remote).
+        let keep = match expected_hash {
+            Some(expected) => hash == expected,
+            None => true,
+        };
+        if let Some(destination) = destination.filter(|_| keep) {
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -1770,6 +1868,46 @@ impl KmoSyncFacade {
             ],
         )?;
         Ok(())
+    }
+
+    /// Marks the local blob as adopted from remote (its content does not hash
+    /// to `book_hash`, because the user resolved a blob conflict in favor of
+    /// the remote version). `sync_book` skips the strict local hash check for
+    /// adopted blobs so the resolution sticks instead of re-arming on the next
+    /// sync.
+    fn mark_blob_adopted(&self, book_hash: &str) -> Result<()> {
+        self.set_blob_adopted(book_hash, 1)
+    }
+
+    fn mark_blob_not_adopted(&self, book_hash: &str) -> Result<()> {
+        self.set_blob_adopted(book_hash, 0)
+    }
+
+    fn set_blob_adopted(&self, book_hash: &str, adopted: i64) -> Result<()> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| SyncError::Internal("database mutex poisoned".to_string()))?;
+        db.execute(
+            "UPDATE blob_index SET adopted_remote = ?1 WHERE book_hash = ?2",
+            rusqlite::params![adopted, book_hash],
+        )?;
+        Ok(())
+    }
+
+    fn is_blob_adopted(&self, book_hash: &str) -> Result<bool> {
+        let db = self
+            .db
+            .lock()
+            .map_err(|_| SyncError::Internal("database mutex poisoned".to_string()))?;
+        let adopted: i64 = db
+            .query_row(
+                "SELECT adopted_remote FROM blob_index WHERE book_hash = ?1",
+                rusqlite::params![book_hash],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(adopted != 0)
     }
 
     fn record_blob_conflict(
@@ -2148,28 +2286,38 @@ fn merge_meta_with_remote(
         logical_ts: 0,
         origin_device_id: String::new(),
         edit_history: Vec::new(),
+        progress_write_ts: 0,
+        progress_writer_device: String::new(),
+        bookmarks_write_ts: 0,
+        bookmarks_writer_device: String::new(),
     });
+    normalize_meta_pairs(&mut base);
 
-    // Capture the local writer identity before either remote block mutates the
-    // base meta. The bookmarks merge decision must compare the new remote
-    // bookmarks against the *original* local ts/device — not the post-progress
-    // copy.
-    let local_wall = base.wall_clock_ts;
-    let local_dev = base.device_id.clone();
-
+    // Progress and bookmarks are two independent LWW clocks. Each envelope
+    // keeps the (ts, device) of the writer whose content it carries, so a
+    // merge that adopts remote progress never re-stamps the locally-written
+    // bookmarks (or vice versa) with the other envelope's timestamp.
     if let Some(rp) = remote_progress
-        && (rp.last_write_ts > local_wall
-            || (rp.last_write_ts == local_wall && rp.last_writer_device_id > local_dev))
+        && remote_pair_wins(
+            rp.last_write_ts,
+            &rp.last_writer_device_id,
+            base.progress_write_ts,
+            &base.progress_writer_device,
+        )
     {
         base.progress = rp.progress.clone();
-        base.wall_clock_ts = rp.last_write_ts;
-        base.device_id = rp.last_writer_device_id.clone();
+        base.progress_write_ts = rp.last_write_ts;
+        base.progress_writer_device = rp.last_writer_device_id.clone();
     }
     if let Some(rb) = remote_bookmarks {
-        let rb_is_newer = rb.last_write_ts > local_wall
-            || (rb.last_write_ts == local_wall && rb.last_writer_device_id > local_dev);
-        let rb_same_writer =
-            rb.last_write_ts == local_wall && rb.last_writer_device_id == local_dev;
+        let rb_is_newer = remote_pair_wins(
+            rb.last_write_ts,
+            &rb.last_writer_device_id,
+            base.bookmarks_write_ts,
+            &base.bookmarks_writer_device,
+        );
+        let rb_same_writer = rb.last_write_ts == base.bookmarks_write_ts
+            && rb.last_writer_device_id == base.bookmarks_writer_device;
         if rb_is_newer {
             // The remote writer is strictly newer: their snapshot is the
             // canonical truth, so an empty remote list (e.g. produced by a
@@ -2185,8 +2333,8 @@ fn merge_meta_with_remote(
             append_missing_bookmarks(&mut base.bookmarks, &local_bookmarks);
             append_missing_highlights(&mut base.highlights, &local_highlights);
             append_missing_notes(&mut base.notes, &local_notes);
-            base.wall_clock_ts = rb.last_write_ts;
-            base.device_id = rb.last_writer_device_id.clone();
+            base.bookmarks_write_ts = rb.last_write_ts;
+            base.bookmarks_writer_device = rb.last_writer_device_id.clone();
         } else if rb_same_writer {
             merge_bookmark_list(&mut base.bookmarks, &rb.bookmarks);
             merge_highlight_list(&mut base.highlights, &rb.highlights);
@@ -2194,7 +2342,46 @@ fn merge_meta_with_remote(
         }
         // else: local is strictly newer; do not pull stale remote entries in.
     }
+    // The meta-level wall clock stays the newest of the two envelopes so the
+    // app-facing single clock still reflects "last changed".
+    let (progress_ts, progress_dev) = (base.progress_write_ts, base.progress_writer_device.clone());
+    let (bookmarks_ts, bookmarks_dev) = (
+        base.bookmarks_write_ts,
+        base.bookmarks_writer_device.clone(),
+    );
+    let (overall_ts, overall_dev) =
+        if remote_pair_wins(bookmarks_ts, &bookmarks_dev, progress_ts, &progress_dev) {
+            (bookmarks_ts, bookmarks_dev)
+        } else {
+            (progress_ts, progress_dev)
+        };
+    base.wall_clock_ts = overall_ts;
+    base.device_id = overall_dev;
     base
+}
+
+/// True when the remote pair `(remote_ts, remote_device)` is strictly newer
+/// than the local pair `(local_ts, local_device)` under LWW tie-breaks.
+fn remote_pair_wins(
+    remote_ts: i64,
+    remote_device: &str,
+    local_ts: i64,
+    local_device: &str,
+) -> bool {
+    remote_ts > local_ts || (remote_ts == local_ts && remote_device > local_device)
+}
+
+/// Fills per-envelope writer pairs from the legacy single clock when they are
+/// missing (older caches / caller JSON that predates the per-envelope fields).
+fn normalize_meta_pairs(meta: &mut BookReadingMeta) {
+    if meta.progress_write_ts == 0 && meta.progress_writer_device.is_empty() {
+        meta.progress_write_ts = meta.wall_clock_ts;
+        meta.progress_writer_device = meta.device_id.clone();
+    }
+    if meta.bookmarks_write_ts == 0 && meta.bookmarks_writer_device.is_empty() {
+        meta.bookmarks_write_ts = meta.wall_clock_ts;
+        meta.bookmarks_writer_device = meta.device_id.clone();
+    }
 }
 
 fn merge_bookmark_list(target: &mut Vec<Bookmark>, incoming: &[Bookmark]) {
@@ -2274,7 +2461,11 @@ fn append_missing_notes(target: &mut Vec<BookNote>, incoming: &[BookNote]) {
 
 fn progress_matches_remote(meta: &BookReadingMeta, remote: Option<&RemoteProgress>) -> bool {
     match remote {
-        Some(rp) => rp.progress == meta.progress && rp.last_write_ts == meta.wall_clock_ts,
+        Some(rp) => {
+            rp.progress == meta.progress
+                && rp.last_write_ts == meta.progress_write_ts
+                && rp.last_writer_device_id == meta.progress_writer_device
+        }
         None => meta.progress.is_none(),
     }
 }
@@ -2285,7 +2476,8 @@ fn bookmarks_matches_remote(meta: &BookReadingMeta, remote: Option<&RemoteBookma
             rb.bookmarks == meta.bookmarks
                 && rb.highlights == meta.highlights
                 && rb.notes == meta.notes
-                && rb.last_write_ts == meta.wall_clock_ts
+                && rb.last_write_ts == meta.bookmarks_write_ts
+                && rb.last_writer_device_id == meta.bookmarks_writer_device
         }
         None => meta.bookmarks.is_empty() && meta.highlights.is_empty() && meta.notes.is_empty(),
     }
@@ -2309,6 +2501,11 @@ fn parse_remote_bookmarks_lists(bytes: &[u8]) -> (Vec<Bookmark>, Vec<Highlight>,
 fn encode_edit_history_archive(edit_history: &[MetaEdit]) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(edit_history)?;
     Ok(zstd::stream::encode_all(Cursor::new(json), 3)?)
+}
+
+fn decode_edit_history_archive(bytes: &[u8]) -> Result<Vec<MetaEdit>> {
+    let json = zstd::stream::decode_all(Cursor::new(bytes))?;
+    Ok(serde_json::from_slice(&json)?)
 }
 
 fn build_crypto(encryption: &EncryptionConfigJson) -> Result<Arc<dyn CryptoProvider>> {
@@ -2797,6 +2994,10 @@ mod tests {
             logical_ts,
             origin_device_id: "device-a".to_string(),
             edit_history: vec![],
+            progress_write_ts: logical_ts,
+            progress_writer_device: "device-a".to_string(),
+            bookmarks_write_ts: logical_ts,
+            bookmarks_writer_device: "device-a".to_string(),
         }
     }
 
@@ -2954,9 +3155,15 @@ mod tests {
 
         facade.put_local_meta(&meta).unwrap();
 
+        // The archive is re-joined on read: callers never observe the
+        // inline-truncated view.
         let stored = facade.read_local_meta("meta-history").unwrap().unwrap();
-        assert_eq!(stored.edit_history.len(), EDIT_HISTORY_RETAINED_INLINE);
-        assert_eq!(stored.edit_history[0].edit_id, "edit-901");
+        assert_eq!(stored.edit_history.len(), EDIT_HISTORY_INLINE_LIMIT + 1);
+        assert_eq!(stored.edit_history[0].edit_id, "edit-0");
+        assert_eq!(
+            stored.edit_history[EDIT_HISTORY_INLINE_LIMIT].edit_id,
+            "edit-1000"
+        );
         let archive = std::fs::read(facade.local_history_path("meta-history")).unwrap();
         let decompressed = zstd::stream::decode_all(Cursor::new(archive)).unwrap();
         let edits: Vec<MetaEdit> = serde_json::from_slice(&decompressed).unwrap();
@@ -3987,6 +4194,10 @@ mod tests {
         resurrected.logical_ts = 3;
         resurrected.modified_ts = 3;
         resurrected.wall_clock_ts = 3;
+        resurrected.progress_write_ts = 3;
+        resurrected.progress_writer_device = "device-b".to_string();
+        resurrected.bookmarks_write_ts = 3;
+        resurrected.bookmarks_writer_device = "device-b".to_string();
         resurrected.highlights[0].comment = "offline edit after delete".to_string();
         facade_b.put_local_meta(&resurrected).unwrap();
 
@@ -3999,9 +4210,13 @@ mod tests {
 
         let remote_bytes = std::fs::read(remote.path().join("book_progress/book-1.json")).unwrap();
         let remote_progress: RemoteProgress = serde_json::from_slice(&remote_bytes).unwrap();
-        // Progress JSON was overwritten by B's higher wall_clock_ts.
-        assert_eq!(remote_progress.last_write_ts, resurrected.wall_clock_ts);
-        assert_eq!(remote_progress.last_writer_device_id, "device-b");
+        // B never re-authored the progress content, so the progress envelope
+        // keeps its original writer pair instead of being re-stamped with B's
+        // bookmarks timestamp (which would let stale progress beat genuinely
+        // newer progress on other devices).
+        assert_eq!(remote_progress.last_write_ts, 1);
+        assert_eq!(remote_progress.last_writer_device_id, "device-a");
+        assert_eq!(remote_progress.progress.unwrap().progress_percent, 0.25);
 
         let bookmarks_bytes = std::fs::read(remote.path().join("bookmarks/book-1.json")).unwrap();
         let remote_bookmarks: RemoteBookmarks = serde_json::from_slice(&bookmarks_bytes).unwrap();
@@ -4042,6 +4257,10 @@ mod tests {
         resurrected.logical_ts = 3;
         resurrected.modified_ts = 3;
         resurrected.wall_clock_ts = 3;
+        resurrected.progress_write_ts = 3;
+        resurrected.progress_writer_device = "device-b".to_string();
+        resurrected.bookmarks_write_ts = 3;
+        resurrected.bookmarks_writer_device = "device-b".to_string();
         resurrected.highlights[0].comment = "restore this".to_string();
         facade_b.put_local_meta(&resurrected).unwrap();
         facade_b.sync_single_meta("book-1", "restore-meta").unwrap();
@@ -4305,5 +4524,108 @@ mod tests {
             .sync_single_meta("book-1", "schema-meta")
             .unwrap_err();
         assert_eq!(error.code(), 11);
+    }
+
+    #[test]
+    fn bookmarks_only_write_does_not_inflate_the_progress_timestamp() {
+        // Regression: merging device B's newer bookmarks must not re-stamp
+        // device A's progress content with B's timestamp. Otherwise A's
+        // genuinely newer progress (written after the stale progress content)
+        // loses the LWW comparison and the reader's progress silently jumps
+        // backwards.
+        let remote = tempfile::tempdir().unwrap();
+        let cache_a = tempfile::tempdir().unwrap();
+        let cache_b = tempfile::tempdir().unwrap();
+        let facade_a = facade_for(cache_a.path(), remote.path(), "device-a");
+        let facade_b = facade_for(cache_b.path(), remote.path(), "device-b");
+
+        // A writes progress 0.25 at ts 100 and syncs.
+        let meta_a = sample_meta("inflation-meta", 0.25, 100);
+        facade_a.put_local_meta(&meta_a).unwrap();
+        facade_a
+            .sync_single_meta("book-1", "inflation-meta")
+            .unwrap();
+
+        // B pulls, then adds a bookmark at ts 200 without touching progress.
+        facade_b
+            .sync_single_meta("book-1", "inflation-meta")
+            .unwrap();
+        let mut meta_b = facade_b.read_local_meta("inflation-meta").unwrap().unwrap();
+        meta_b.logical_ts = 200;
+        meta_b.modified_ts = 200;
+        meta_b.wall_clock_ts = 200;
+        meta_b.device_id = "device-b".to_string();
+        meta_b.bookmarks.push(Bookmark {
+            bookmark_id: "bm-b".to_string(),
+            cfi_range: "range".to_string(),
+            title: "b".to_string(),
+            create_ts: 200,
+        });
+        facade_b.put_local_meta(&meta_b).unwrap();
+        facade_b
+            .sync_single_meta("book-1", "inflation-meta")
+            .unwrap();
+
+        // The remote progress envelope must keep A's original pair: B never
+        // re-authored the progress content.
+        let remote_bytes = std::fs::read(remote.path().join("book_progress/book-1.json")).unwrap();
+        let remote_progress: RemoteProgress = serde_json::from_slice(&remote_bytes).unwrap();
+        assert_eq!(remote_progress.last_write_ts, 100);
+        assert_eq!(remote_progress.last_writer_device_id, "device-a");
+
+        // A keeps reading to 0.75 at ts 150 — genuinely newer than 0.25@100.
+        // It must win the LWW comparison and not be beaten by the stale 0.25
+        // content inflated to B's bookmarks timestamp.
+        let meta_a2 = sample_meta("inflation-meta", 0.75, 150);
+        facade_a.put_local_meta(&meta_a2).unwrap();
+        facade_a
+            .sync_single_meta("book-1", "inflation-meta")
+            .unwrap();
+        let local_a = facade_a.read_local_meta("inflation-meta").unwrap().unwrap();
+        assert_eq!(
+            local_a.progress.unwrap().progress_percent,
+            0.75,
+            "newer local progress must not be overwritten by stale remote content"
+        );
+        let remote_bytes = std::fs::read(remote.path().join("book_progress/book-1.json")).unwrap();
+        let remote_progress: RemoteProgress = serde_json::from_slice(&remote_bytes).unwrap();
+        assert_eq!(
+            remote_progress.progress.unwrap().progress_percent,
+            0.75,
+            "remote progress must converge on the newer content"
+        );
+    }
+
+    #[test]
+    fn resolve_blob_conflict_remote_materializes_remote_and_does_not_recur() {
+        let remote = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let facade = facade_for(cache.path(), remote.path(), "device-a");
+        let source = cache.path().join("source.epub");
+        std::fs::write(&source, b"correct epub bytes").unwrap();
+        let book_hash = blake3_file_hex(&source).unwrap();
+        facade.put_local_book(&book_hash, &source).unwrap();
+
+        // First sync uploads the book, then another actor replaces the remote
+        // object with corrupt content that does not hash to book_hash.
+        facade.sync_book(&book_hash).unwrap();
+        let remote_blob = remote.path().join(format!("books/{book_hash}"));
+        std::fs::write(&remote_blob, b"corrupt remote bytes").unwrap();
+        facade.sync_book(&book_hash).unwrap();
+        assert_eq!(facade.conflict_count().unwrap(), 1);
+
+        // Resolving in favor of remote must download the remote blob into the
+        // local cache (previously it was a no-op that only cleared the row,
+        // so the very next sync re-recorded the conflict forever).
+        facade.resolve_blob_conflict(&book_hash, "remote").unwrap();
+        assert_eq!(facade.conflict_count().unwrap(), 0);
+        let local_after =
+            std::fs::read(cache.path().join(format!("blobs/{book_hash}.epub"))).unwrap();
+        assert_eq!(local_after, b"corrupt remote bytes");
+
+        // The resolution must stick: a follow-up sync neither errors out nor
+        // re-arms the conflict.
+        facade.sync_book(&book_hash).unwrap();
+        assert_eq!(facade.conflict_count().unwrap(), 0);
     }
 }

@@ -81,6 +81,23 @@ pub mod proto {
         pub origin_device_id: String,
         #[prost(message, repeated, tag = "12")]
         pub edit_history: Vec<MetaEdit>,
+        // Per-envelope LWW clocks. `wall_clock_ts`/`device_id` describe the
+        // meta as a whole; each remote envelope keeps its own writer identity
+        // so merging one envelope from a newer writer never re-stamps the
+        // other envelope's content with that writer's timestamp (which would
+        // let stale content beat genuinely newer data on other devices).
+        #[prost(int64, tag = "13")]
+        #[serde(default)]
+        pub progress_write_ts: i64,
+        #[prost(string, tag = "14")]
+        #[serde(default)]
+        pub progress_writer_device: String,
+        #[prost(int64, tag = "15")]
+        #[serde(default)]
+        pub bookmarks_write_ts: i64,
+        #[prost(string, tag = "16")]
+        #[serde(default)]
+        pub bookmarks_writer_device: String,
     }
 
     #[derive(Clone, PartialEq, Message, Serialize, Deserialize)]
@@ -183,6 +200,10 @@ mod tests {
                 logical_ts: 1,
                 op: None,
             }],
+            progress_write_ts: 1,
+            progress_writer_device: "device-a".to_string(),
+            bookmarks_write_ts: 1,
+            bookmarks_writer_device: "device-a".to_string(),
         }
     }
 
@@ -221,10 +242,16 @@ mod tests {
             logical_ts: 0,
             origin_device_id: String::new(),
             edit_history: vec![],
+            progress_write_ts: 0,
+            progress_writer_device: String::new(),
+            bookmarks_write_ts: 0,
+            bookmarks_writer_device: String::new(),
         };
 
         let decoded = decode_meta(&encode_meta(&old).unwrap()).unwrap();
         assert_eq!(decoded.logical_ts, 0);
         assert!(decoded.edit_history.is_empty());
+        assert_eq!(decoded.progress_write_ts, 0);
+        assert!(decoded.progress_writer_device.is_empty());
     }
 }

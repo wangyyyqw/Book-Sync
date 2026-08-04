@@ -122,6 +122,10 @@ fn meta_sync_minio_two_devices() {
         logical_ts: 1,
         origin_device_id: "device-a".to_string(),
         edit_history: vec![],
+        bookmarks_write_ts: 1,
+        bookmarks_writer_device: "device-a".to_string(),
+        progress_write_ts: 1,
+        progress_writer_device: "device-a".to_string(),
     };
 
     facade_a.put_local_meta(&meta).unwrap();
