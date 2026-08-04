@@ -358,6 +358,15 @@ sync.exportMetadataBackup()
 
 ## 示例应用
 
+仓库里有两个示例：
+
+- `samples/kmp-reader-sync/` — Android / iOS 双平台示例应用，同一份远端存储配置即可测试跨设备同步。
+- `samples/guanzhi-sync-demo/` — 面向观止（guanzhi）阅读器接入的 JVM 同步演示：模拟手机/平板两台设备同步进度、书签、划线、笔记与删除/复活 tombstone，并输出断言报告：
+
+  ```bash
+  gradle :samples:guanzhi-sync-demo:run
+  ```
+
 构建 Android 示例：
 
 ```bash
